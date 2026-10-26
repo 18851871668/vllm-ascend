@@ -184,6 +184,24 @@ __aicore__ inline void ExtractIndex(const LocalTensor<uint32_t> &idxULocal, cons
 }
 
 /**
+  return_value: 从排序后的 (value, index) 交错序列中抽取偶数 lane 的分数。
+  src/dst 均按 uint32 视图操作, 调用方按 float 解释 dst。
+ */
+__aicore__ inline void ExtractValue(const LocalTensor<uint32_t> &valULocal, const LocalTensor<uint32_t> &sortLocal,
+                                    int64_t extractNum)
+{
+    AscendC::GatherMaskParams gatherMaskParams;
+    gatherMaskParams.repeatTimes = Ceil(extractNum * sizeof(float) * VALUE_AND_INDEX_NUM, VEC_REPEAT_BYTES);
+    gatherMaskParams.src0BlockStride = 1;
+    gatherMaskParams.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
+    gatherMaskParams.src1RepeatStride = 0;
+    uint64_t rsvdCnt = 0;
+    uint8_t src1Pattern = 1; // 固定模式1, 表示筛选出偶数索引的数 (value)
+    AscendC::GatherMask(valULocal, sortLocal, src1Pattern, false, static_cast<uint32_t>(0), gatherMaskParams, rsvdCnt);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+/**
   候选路径专用合并: 与 MergeSort 语义相同, 但回拷 mrgDst 用纯向量 Adds (64 分块)。
   MergeSort 尾部的 UB->UB DataCopy 若走 MTE 管道, 其后的 PipeBarrier<PIPE_V> 不构成 fence,
   跨 tile/跨行对累加器的下一次 MrgSort 读存在调度敏感竞态 (实测多 tile 场景 tile1 读到 tile0 stale

@@ -107,7 +107,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
     const c10::optional<at::Tensor> &blockTable, const c10::optional<at::Tensor> &outputIdxOffset,
     const c10::optional<at::Tensor> &metadata, int64_t maxSeqlenQ, c10::string_view layoutQ,
     c10::string_view layoutK, int64_t maskMode, int64_t cmpRatio, int64_t candidateMode,
-    int64_t candidateTopkBlocks, int64_t candidateBlockSize)
+    int64_t candidateTopkBlocks, int64_t candidateBlockSize, bool enableDcp, int64_t cpWorld, int64_t cpRank,
+    int64_t cpKvCacheInterleaveSize, const c10::optional<at::Tensor> &causalSeqlensKvGlobal, int64_t returnValue)
 {
     TORCH_CHECK(query.numel() > 0, "Tensor query is empty.")
     TORCH_CHECK(key.numel() > 0, "Tensor key is empty.")
@@ -116,7 +117,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
     std::string keyLayoutStr = std::string(layoutK);
 
     std::tuple<at::Tensor, at::Tensor> quantLightningIndexerOutput =
-        ConstructQuantLightningIndexerOutputTensor(query, key, topk, queryLayoutStr, keyLayoutStr, 0);
+        ConstructQuantLightningIndexerOutputTensor(query, key, topk, queryLayoutStr, keyLayoutStr, returnValue);
     at::Tensor sparseIndicesOut = std::get<0>(quantLightningIndexerOutput);
     at::Tensor sparseValuesOut = std::get<1>(quantLightningIndexerOutput);
 
@@ -136,7 +137,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
 
     char *queryLayoutPtr = const_cast<char *>(queryLayoutStr.c_str());
     char *keyLayoutPtr = const_cast<char *>(keyLayoutStr.c_str());
-    int64_t returnValue = 0;
 
     TORCH_CHECK(candidateMode >= 1 && candidateMode <= 3, "Invalid candidate_mode");
     TORCH_CHECK(candidateMode != 2 || candidateTopkIndexIn.has_value(), "Consumer requires candidate blocks");
@@ -149,9 +149,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
 
     EXEC_NPU_CMD(aclnnVllmAscendQuantLightningIndexerV2, query, key, weights, queryDequantScale, keyDequantScale,
               cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, blockTable, outputIdxOffset,
-              metadata, candidateTopkIndexIn, topk, quantMode, maxSeqlenQ, queryLayoutPtr, keyLayoutPtr, maskMode,
-              cmpRatio, returnValue, candidateMode, candidateTopkBlocks, candidateBlockSize, keyStride0,
-              keyScaleStride0, sparseIndicesOut, sparseValuesOut, candidateTopkIndexOut);
+              metadata, candidateTopkIndexIn, causalSeqlensKvGlobal, topk, quantMode, maxSeqlenQ, queryLayoutPtr,
+              keyLayoutPtr, maskMode, cmpRatio, returnValue, candidateMode, candidateTopkBlocks, candidateBlockSize,
+              keyStride0, keyScaleStride0, enableDcp, cpWorld, cpRank, cpKvCacheInterleaveSize, sparseIndicesOut,
+              sparseValuesOut, candidateTopkIndexOut);
 
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(sparseIndicesOut, sparseValuesOut, candidateTopkIndexOut);
 }

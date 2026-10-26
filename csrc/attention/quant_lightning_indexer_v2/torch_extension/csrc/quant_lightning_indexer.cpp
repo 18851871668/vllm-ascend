@@ -167,8 +167,9 @@ std::tuple<at::Tensor, at::Tensor> QuantLightningIndexer(
     const c10::optional<at::Tensor> &cuSeqlensK, const c10::optional<at::Tensor> &sequsedQ,
     const c10::optional<at::Tensor> &sequsedK, const c10::optional<at::Tensor> &cmpResidualK,
     const c10::optional<at::Tensor> &blockTable, const c10::optional<at::Tensor> &outputIdxOffset,
-    const c10::optional<at::Tensor> &metadata, int64_t maxSeqlenQ, c10::string_view layoutQ, c10::string_view layoutK,
-    int64_t maskMode, int64_t cmpRatio, int64_t returnValue)
+    const c10::optional<at::Tensor> &metadata, const c10::optional<at::Tensor> &causalSeqlensKvGlobal,
+    int64_t maxSeqlenQ, c10::string_view layoutQ, c10::string_view layoutK, int64_t maskMode, int64_t cmpRatio,
+    int64_t returnValue, bool enableDcp, int64_t cpWorld, int64_t cpRank, int64_t cpKvCacheInterleaveSize)
 {
     TORCH_CHECK(query.numel() > 0, "Tensor query is empty.")
     TORCH_CHECK(key.numel() > 0, "Tensor key is empty.")
@@ -193,11 +194,13 @@ std::tuple<at::Tensor, at::Tensor> QuantLightningIndexer(
 
     int64_t keyStride0Disabled = 0;   // A11: 旧入口不启用 stride 显式属性 (保持现网行为)
     int64_t keyScaleStride0Disabled = 0;
+    // candidate 在旧入口恒关闭: 传空输入 + 默认属性, 输出为空 tensor
+    at::Tensor candidateTopkIndexOut = at::empty({0}, query.options().dtype(at::kInt));
     ACLNN_CMD(aclnnVllmAscendQuantLightningIndexerV2, queryWrapper, keyWrapper, weights, queryScaleWrapper, keyScaleWrapper,
-              cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, blockTable, outputIdxOffset, metadata, topk,
-              quantMode, maxSeqlenQ, queryLayoutPtr, keyLayoutPtr, maskMode, cmpRatio, returnValue,
-              keyStride0Disabled, keyScaleStride0Disabled, sparseIndicesOut,
-              sparseValuesOut);
+              cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, blockTable, outputIdxOffset, metadata,
+              c10::nullopt, causalSeqlensKvGlobal, topk, quantMode, maxSeqlenQ, queryLayoutPtr, keyLayoutPtr, maskMode,
+              cmpRatio, returnValue, 3, 2048, 8, keyStride0Disabled, keyScaleStride0Disabled, enableDcp, cpWorld, cpRank,
+              cpKvCacheInterleaveSize, sparseIndicesOut, sparseValuesOut, candidateTopkIndexOut);
 
     return std::tuple<at::Tensor, at::Tensor>(sparseIndicesOut, sparseValuesOut);
 }
@@ -257,9 +260,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
 
     ACLNN_CMD(aclnnVllmAscendQuantLightningIndexerV2, queryWrapper, keyWrapper, weights, queryScaleWrapper, keyScaleWrapper,
               cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, blockTable, outputIdxOffset,
-              metadata, candidateTopkIndexIn, topk, quantMode, maxSeqlenQ, queryLayoutPtr, keyLayoutPtr, maskMode,
-              cmpRatio, returnValue, candidateMode, candidateTopkBlocks, candidateBlockSize, keyStride0,
-              keyScaleStride0, sparseIndicesOut, sparseValuesOut, candidateTopkIndexOut);
+              metadata, candidateTopkIndexIn, c10::nullopt, topk, quantMode, maxSeqlenQ, queryLayoutPtr, keyLayoutPtr,
+              maskMode, cmpRatio, returnValue, candidateMode, candidateTopkBlocks, candidateBlockSize, keyStride0,
+              keyScaleStride0, false, 1, 0, 1, sparseIndicesOut, sparseValuesOut, candidateTopkIndexOut);
 
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(sparseIndicesOut, sparseValuesOut, candidateTopkIndexOut);
 }

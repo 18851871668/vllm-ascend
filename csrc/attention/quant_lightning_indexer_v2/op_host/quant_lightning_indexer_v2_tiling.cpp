@@ -241,6 +241,9 @@ void QLIV2InfoParser::GetOptionalInputParaInfo()
     opParamInfo_.metadata.desc = context_->GetOptionalInputDesc(METADATA_INDEX);
     opParamInfo_.candidateTopkIndex.tensor = context_->GetOptionalInputTensor(CANDIDATE_TOPK_INDEX_INPUT_INDEX);
     opParamInfo_.candidateTopkIndex.desc = context_->GetOptionalInputDesc(CANDIDATE_TOPK_INDEX_INPUT_INDEX);
+    // DCP (Decode Context Parallel, 解码上下文并行): 每请求全局 exclusive 上界 C
+    opParamInfo_.causalSeqLensKvGlobal.tensor = context_->GetOptionalInputTensor(CAUSAL_SEQLENS_KV_GLOBAL_INDEX);
+    opParamInfo_.causalSeqLensKvGlobal.desc = context_->GetOptionalInputDesc(CAUSAL_SEQLENS_KV_GLOBAL_INDEX);
 }
 
 void QLIV2InfoParser::GetInputParaInfo()
@@ -291,6 +294,11 @@ ge::graphStatus QLIV2InfoParser::GetAttrParaInfo()
     // 两路都空 = 紧凑存储
     opParamInfo_.keyStride0Attr = attrs->GetAttrPointer<int32_t>(ATTR_KEY_STRIDE0_INDEX);
     opParamInfo_.keyDequantScaleStride0Attr = attrs->GetAttrPointer<int32_t>(ATTR_KEY_DEQUANT_SCALE_STRIDE0_INDEX);
+    // ---- DCP (Decode Context Parallel, 解码上下文并行) ----
+    opParamInfo_.enableDcp = attrs->GetAttrPointer<bool>(ATTR_ENABLE_DCP_INDEX);
+    opParamInfo_.cpWorld = attrs->GetAttrPointer<int32_t>(ATTR_CP_WORLD_INDEX);
+    opParamInfo_.cpRank = attrs->GetAttrPointer<int32_t>(ATTR_CP_RANK_INDEX);
+    opParamInfo_.cpInterleaveSize = attrs->GetAttrPointer<int32_t>(ATTR_CP_KV_CACHE_INTERLEAVE_SIZE_INDEX);
     auto keyStrides = context_->GetDynamicInputStride(KEY_INDEX, 0);
     auto keyDequantScaleStrides = context_->GetDynamicInputStride(KEY_DEQUANT_SCALE_INDEX, 0);
     if (keyStrides != nullptr && keyStrides->GetDimNum() > 0) {
@@ -409,7 +417,10 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
     }
 
     if (npuArch_ == NpuArch::DAV_2201) {
-        OP_CHECK_IF(*opParamInfo_.returnValue, OP_LOGE(opName_, "input attr returnValue only supported False."),
+        // DCP 跨 rank 全局 TopK 需要 score: arch22 打开 return_value=1, 无效槽输出 -inf。
+        OP_CHECK_IF((*opParamInfo_.returnValue != 0) && (*opParamInfo_.returnValue != 1),
+                    OP_LOGE(opName_, "input attr returnValue only supported 0 or 1, but now is %ld.",
+                            *opParamInfo_.returnValue),
                     return ge::GRAPH_FAILED);
     } else if (npuArch_ == NpuArch::DAV_3510) {
         OP_CHECK_IF((*opParamInfo_.returnValue != 0) && (*opParamInfo_.returnValue != 1),
@@ -477,6 +488,61 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
                                                                  "candidate_mode=2(consumer)"),
                         return ge::GRAPH_FAILED);
         }
+    }
+
+    // -------------------DCP (Decode Context Parallel, 解码上下文并行) 校验-------------------
+    // 关闭时做反向严格校验, 保证既有调用零变化; 开启时只开放 arch22 的 TND + PA 路径。
+    bool enableDcp = (opParamInfo_.enableDcp != nullptr) ? *opParamInfo_.enableDcp : false;
+    int32_t cpWorld = (opParamInfo_.cpWorld != nullptr) ? *opParamInfo_.cpWorld : 1;
+    int32_t cpRank = (opParamInfo_.cpRank != nullptr) ? *opParamInfo_.cpRank : 0;
+    int32_t cpInterleaveSize =
+        (opParamInfo_.cpInterleaveSize != nullptr) ? *opParamInfo_.cpInterleaveSize : 1;
+    if (enableDcp) {
+        OP_CHECK_IF(npuArch_ != NpuArch::DAV_2201,
+                    OP_LOGE(opName_, "enable_dcp is only supported on ascend910b/ascend910_93 currently."),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(std::string(opParamInfo_.layOutQuery) != "TND",
+                    OP_LOGE(opName_, "enable_dcp requires layout_q=TND, but got %s.",
+                            std::string(opParamInfo_.layOutQuery).c_str()),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(std::string(opParamInfo_.layOutKey) != "PA_BBND",
+                    OP_LOGE(opName_, "enable_dcp requires layout_k=PA_BBND, but got %s.",
+                            std::string(opParamInfo_.layOutKey).c_str()),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(*opParamInfo_.cmpRatio != 1,
+                    OP_LOGE(opName_, "enable_dcp requires cmp_ratio=1, but got %ld.", *opParamInfo_.cmpRatio),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(candidateMode != CANDIDATE_MODE_OFF,
+                    OP_LOGE(opName_, "enable_dcp is mutually exclusive with candidate_mode, but got %u.",
+                            candidateMode),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(*opParamInfo_.returnValue != 1,
+                    OP_LOGE(opName_, "enable_dcp requires return_value=1 (cross-rank global TopK needs scores)."),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(opParamInfo_.causalSeqLensKvGlobal.tensor == nullptr,
+                    OP_LOGE(opName_, "causal_seqlens_kv_global is required when enable_dcp=true."),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(cpWorld < 1,
+                    OP_LOGE(opName_, "cp_world must >= 1, but got %d.", cpWorld), return ge::GRAPH_FAILED);
+        OP_CHECK_IF((cpRank < 0) || (cpRank >= cpWorld),
+                    OP_LOGE(opName_, "cp_rank must be in [0, cp_world), but got rank=%d world=%d.", cpRank, cpWorld),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(cpInterleaveSize < 1,
+                    OP_LOGE(opName_, "cp_kv_cache_interleave_size must >= 1, but got %d.", cpInterleaveSize),
+                    return ge::GRAPH_FAILED);
+        // DCP 下索引保持本地逻辑序号, 由框架统一转全局; 再叠加 output_idx_offset 会重复偏移。
+        OP_CHECK_IF(opParamInfo_.outputIdxOffset.tensor != nullptr,
+                    OP_LOGE(opName_, "output_idx_offset must be null when enable_dcp=true."),
+                    return ge::GRAPH_FAILED);
+    } else {
+        OP_CHECK_IF((cpWorld != 1) || (cpRank != 0) || (cpInterleaveSize != 1),
+                    OP_LOGE(opName_, "cp_world/cp_rank/cp_kv_cache_interleave_size must be 1/0/1 when "
+                                     "enable_dcp=false, but got %d/%d/%d.",
+                            cpWorld, cpRank, cpInterleaveSize),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(opParamInfo_.causalSeqLensKvGlobal.tensor != nullptr,
+                    OP_LOGE(opName_, "causal_seqlens_kv_global must be null when enable_dcp=false."),
+                    return ge::GRAPH_FAILED);
     }
 
     return ge::GRAPH_SUCCESS;
@@ -1143,7 +1209,7 @@ ge::graphStatus QLIV2InfoParser::ValidateInputShapesMatch()
                             std::to_string(opParamInfo_.attenOut.shape->GetStorageShape().GetDim(0)) +
                             " respectively, they must be same"),
                     return ge::GRAPH_FAILED);
-        if (npuArch_ == NpuArch::DAV_3510) {
+        if (npuArch_ == NpuArch::DAV_3510 || npuArch_ == NpuArch::DAV_2201) {
             if (*opParamInfo_.returnValue == 1 && opParamInfo_.sparseValues.shape != nullptr) {
                 OP_CHECK_IF((opParamInfo_.sparseValues.shape->GetStorageShape().GetDim(0) != qTsize),
                             OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
@@ -1285,8 +1351,25 @@ ge::graphStatus QLIV2InfoParser::ValidateInputShapesMatch()
                 "The shape size of cmp_residual_k must be equal to batch_size (" + std::to_string(bSize_) + ")"),
             return ge::GRAPH_FAILED);
     }
+    // -----------------------check causal_seqlens_kv_global (DCP)-------------------
+    if (opParamInfo_.causalSeqLensKvGlobal.tensor != nullptr) {
+        OP_CHECK_IF(
+            (opParamInfo_.causalSeqLensKvGlobal.desc == nullptr) ||
+                (opParamInfo_.causalSeqLensKvGlobal.desc->GetDataType() != ge::DT_INT32),
+            OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(opName_, "causal_seqlens_kv_global", "not int32",
+                                                  "The dtype of causal_seqlens_kv_global only supports int32"),
+            return ge::GRAPH_FAILED);
+        OP_CHECK_IF(
+            (opParamInfo_.causalSeqLensKvGlobal.tensor->GetShapeSize() != bSize_),
+            OP_LOGE_FOR_INVALID_SHAPESIZE_WITH_REASON(
+                opName_, "causal_seqlens_kv_global",
+                std::to_string(opParamInfo_.causalSeqLensKvGlobal.tensor->GetShapeSize()),
+                "The shape size of causal_seqlens_kv_global must be equal to batch_size (" +
+                    std::to_string(bSize_) + ")"),
+            return ge::GRAPH_FAILED);
+    }
     // -----------------------check sparse_values------------------
-    if (npuArch_ == NpuArch::DAV_3510) {
+    if ((npuArch_ == NpuArch::DAV_3510) || (npuArch_ == NpuArch::DAV_2201)) {
         if (*opParamInfo_.returnValue == 1) {
             OP_CHECK_IF((opParamInfo_.sparseValues.shape->GetStorageShape().GetDim(outN2Dim) != n2Size_),
                         OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
@@ -1603,6 +1686,14 @@ void QLIV2InfoParser::GenerateInfo(QLIV2TilingInfo &QLIV2Info)
     QLIV2Info.candidateBlockSize = (opParamInfo_.candidateBlockSize != nullptr) ?
                                        static_cast<uint32_t>(*opParamInfo_.candidateBlockSize) :
                                        CANDIDATE_BLOCK_SIZE_DEFAULT;
+    // ---- DCP (Decode Context Parallel, 解码上下文并行) ----
+    QLIV2Info.dcpEnable = (opParamInfo_.enableDcp != nullptr) ? *opParamInfo_.enableDcp : false;
+    QLIV2Info.cpWorld = (opParamInfo_.cpWorld != nullptr) ?
+                            static_cast<uint32_t>(*opParamInfo_.cpWorld) : 1U;
+    QLIV2Info.cpRank = (opParamInfo_.cpRank != nullptr) ?
+                           static_cast<uint32_t>(*opParamInfo_.cpRank) : 0U;
+    QLIV2Info.cpInterleaveSize = (opParamInfo_.cpInterleaveSize != nullptr) ?
+                                     static_cast<uint32_t>(*opParamInfo_.cpInterleaveSize) : 1U;
 
     QLIV2Info.keyStridesVec = keyStridesVec_;
     QLIV2Info.keyDequantScaleStridesVec = keyDequantScaleStridesVec_;
@@ -1762,6 +1853,11 @@ ge::graphStatus QuantLightningIndexerV2Tiling::DoTiling(QLIV2TilingInfo *tilingI
     tilingData_.set_candidateMode(tilingInfo->candidateMode);
     tilingData_.set_candidateTopkBlocks(tilingInfo->candidateTopkBlocks);
     tilingData_.set_candidateBlockSize(tilingInfo->candidateBlockSize);
+    // ---- DCP (Decode Context Parallel, 解码上下文并行) ----
+    tilingData_.set_dcpEnable(static_cast<uint32_t>(tilingInfo->dcpEnable));
+    tilingData_.set_cpWorld(tilingInfo->cpWorld);
+    tilingData_.set_cpRank(tilingInfo->cpRank);
+    tilingData_.set_cpInterleaveSize(tilingInfo->cpInterleaveSize);
     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
 

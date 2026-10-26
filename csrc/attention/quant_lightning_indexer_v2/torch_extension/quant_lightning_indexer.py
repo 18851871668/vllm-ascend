@@ -36,8 +36,10 @@ class QuantLightningIndexerOpBuilder(OpBuilder):
             "Tensor key_dequant_scale, int topk, int quant_mode, *, Tensor? cu_seqlens_q=None, "
             "Tensor? cu_seqlens_k=None, Tensor? seqused_q=None, Tensor? seqused_k=None, Tensor? "
             "cmp_residual_k = None, Tensor? block_table=None, Tensor? output_idx_offset=None, Tensor? metadata=None, "
+            "Tensor? causal_seqlens_kv_global=None, "
             'int max_seqlen_q=-1, str layout_q="BSND", str layout_k="BSND", int mask_mode=0, '
-            "int cmp_ratio=1, int return_value=0) -> (Tensor, Tensor)",
+            "int cmp_ratio=1, int return_value=0, bool enable_dcp=False, int cp_world=1, int cp_rank=0, "
+            "int cp_kv_cache_interleave_size=1) -> (Tensor, Tensor)",
             # O1 方案b: candidate 两级TopK 新入口 (三元组), 旧 schema 保持不变
             "quant_lightning_indexer_candidate(Tensor query, Tensor key, Tensor weights, "
             "Tensor query_dequant_scale, Tensor key_dequant_scale, int topk, int quant_mode, *, "
@@ -95,12 +97,17 @@ class QuantLightningIndexerOpBuilder(OpBuilder):
             block_table=None,
             output_idx_offset=None,
             metadata=None,
+            causal_seqlens_kv_global=None,
             max_seqlen_q=-1,
             layout_q="BSND",
             layout_k="BSND",
             mask_mode=0,
             cmp_ratio=1,
             return_value=0,
+            enable_dcp=False,
+            cp_world=1,
+            cp_rank=0,
+            cp_kv_cache_interleave_size=1,
         ):
             key_head_num = key.shape[1] if layout_k == "TND" else key.shape[2]
 
@@ -377,12 +384,17 @@ def quant_lightning_indexer(
     block_table=None,
     output_idx_offset=None,
     metadata=None,
+    causal_seqlens_kv_global=None,
     max_seqlen_q=-1,
     layout_q="BSND",
     layout_k="BSND",
     mask_mode=0,
     cmp_ratio=1,
     return_value=0,
+    enable_dcp=False,
+    cp_world=1,
+    cp_rank=0,
+    cp_kv_cache_interleave_size=1,
 ):
     """
     dispatcher implementation for NPU.zhe
@@ -405,12 +417,17 @@ def quant_lightning_indexer(
         block_table,
         output_idx_offset,
         metadata,
+        causal_seqlens_kv_global,
         max_seqlen_q,
         layout_q,
         layout_k,
         mask_mode,
         cmp_ratio,
         return_value,
+        enable_dcp,
+        cp_world,
+        cp_rank,
+        cp_kv_cache_interleave_size,
     )
 
 

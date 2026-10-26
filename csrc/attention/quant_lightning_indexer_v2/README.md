@@ -39,6 +39,7 @@
 | block_table                    | 可选输入      | 表示PageAttention中KV存储使用的block映射表。 | INT32       | ND         |
 | output_idx_offset                    | 可选输入      | 输出索引的偏移量 | INT32       | ND         |
 | metadata                    | 可选输入      | QuantLightningIndexerV2Metadata算子传入的分核信息，包含使用核数、分块大小以及每个核处理数据的起始点等内容。 | INT32       | ND         |
+| causal_seqlens_kv_global    | 可选输入      | DCP（Decode Context Parallel，解码上下文并行）场景下每个请求本次 Q 片段的全局 exclusive 上界 C（最后一个 Q 行的全局位置 + 1）；非 batch 前缀和，不是物理 cache 容量。`enable_dcp` 为 true 时必传 | INT32       | ND         |
 | quant_mode                 | 属性      | 用于标识输入的量化模式。 | INT32          | -         |
 | max_seqlen_q                 | 可选属性| Query的最大序列长度，默认值-1表示任意可能长度 | INT32 | -         |
 | layout_q                 | 可选属性| 用于标识输入`query`的数据排布格式，默认值"BSND"。 | STRING | -         |
@@ -46,7 +47,11 @@
 | topk  | 属性      | 代表topK阶段需要保留的索引数量，默认值2048。 | INT32          | -         |
 | mask_mode | 可选属性      | 表示mask的模式，默认值0。 | INT32          | -         |
 | cmp_ratio      | 可选属性      | 用于稀疏计算，表示key的压缩倍数，默认值1。 | INT32          | -         |
-| return_value      |  可选属性     | 表示是否输出`sparse_values`，默认值0。 | INT32          | -         |
+| return_value      |  可选属性     | 表示是否输出`sparse_values`，默认值0。DCP 场景要求为1（跨 rank 全局 TopK 需要 score）。 | INT32          | -         |
+| enable_dcp      |  可选属性     | 是否开启 DCP（Decode Context Parallel，解码上下文并行）位置语义，默认值false。 | BOOL          | -         |
+| cp_world      |  可选属性     | CP 组大小 P，默认值1。 | INT32          | -         |
+| cp_rank      |  可选属性     | 当前 rank r，默认值0，要求 0 ≤ r < cp_world。 | INT32          | -         |
+| cp_kv_cache_interleave_size      |  可选属性     | 每 S 个 token 轮换 rank，默认值1；逐 token 分片为1，整 block 分片时传物理 block_size。 | INT32          | -         |
 | sparse_indices     | 输出      | 公式中的输出Out，参与稀疏attention计算的token索引值。 | INT32          | ND         |
 | sparse_values           | 输出      | 公式中的Indices输出对应的value值。`return_value`为1时shape与`sparse_indices`一致，`return_value`为0时shape为(0,) | BFLOAT16         | ND          |
 
@@ -66,9 +71,31 @@
     - `query`、`key`支持INT8，不支持FLOAT8_e4m3fn、HIFLOAT8和FLOAT4_e2m1。
     - `query_dequant_scale`和`key_dequant_scale`支持FLOAT16，不支持FLOAT32和FLOAT8_e8m0。
     - `weights`支持FLOAT16，不支持FLOAT32。
-    - 不支持`output_idx_offset`和`return_value`。
+    - 不支持`output_idx_offset`；`return_value` 支持 0/1（DCP 跨 rank 全局 TopK 需要 score，DCP 场景强制为1）。
     - `query`的N仅支持64，`key`的N仅支持1。
     - `topk`支持[1, 2048]。
+
+## DCP（Decode Context Parallel，解码上下文并行）
+
+CP 场景下 KV cache 按 token 轮转切分到各卡，算子不再需要框架构造二维 mask，而是由 `enable_dcp` + `cp_world`/`cp_rank`/`cp_kv_cache_interleave_size` + `causal_seqlens_kv_global` 直接计算每行本 rank 的可见长度：
+
+```
+global_q = C - Q_len + i
+global_k = ((local_k // S) * P + r) * S + local_k % S
+visible  = (local_k < L) and (global_k <= global_q)
+```
+
+其中 `C = causal_seqlens_kv_global[b]`，`L = seqused_k[b]`（本地有效长度），`P/cp_world`、`r/cp_rank`、`S/cp_kv_cache_interleave_size`。
+
+DCP 约束（arch22 / Atlas A3、A2）：
+- `layout_q` 必须为 TND，`layout_k` 必须为 PA_BBND；
+- `cmp_ratio` 必须为 1（CP 不与 KV 压缩叠加）；
+- `candidate_mode` 必须为 3（DCP 与两级 candidate 互斥）；
+- `return_value` 必须为 1；
+- 不能传 `output_idx_offset`；
+- 输出 index 为**本地逻辑 KV 序号**，由框架按 `global = (local // S * P + r) * S + local % S` 转全局后合并 TopK。
+
+设计细节见 [docs/qli_v2_dcp_design.md](docs/qli_v2_dcp_design.md)。
 
 ## 调用示例
 
