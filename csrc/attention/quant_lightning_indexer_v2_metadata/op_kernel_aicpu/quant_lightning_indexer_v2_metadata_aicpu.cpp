@@ -55,6 +55,7 @@ bool QuantLightningIndexerV2MetadataCpuKernel::Prepare(CpuKernelContext &ctx)
     GetAttrValueOpt(ctx, "layout_k", layoutK_);
     GetAttrValueOpt(ctx, "mask_mode", maskMode_);
     GetAttrValueOpt(ctx, "cmp_ratio", cmpRatio_);
+    GetAttrValueOpt(ctx, "enable_dcp", enableDcp_);
 
     return (ParamsCheck() && ParamsInit());
 }
@@ -326,7 +327,16 @@ void QuantLightningIndexerV2MetadataCpuKernel::CalcSplitInfo(SplitContext &split
         }
     }
     ValidSocVersion validSocVersion = ProcessSocVersion();
-    if (validSocVersion == ValidSocVersion::ASCEND950) {
+    // FD/LD (Flash Decode, 跨核 S2 切分 + TopK 归约) 的 SoC 门禁:
+    // - 950 维持原有行为 (不区分场景);
+    // - A2/A3 (910B/910_93) 仅在 DCP (Decode Context Parallel, 解码上下文并行) 场景打开。
+    //   DCP 下每个核拿到的是本地完整 L 的一个连续 S2 段, 每行的可见前缀是绝对长度, 段内自行裁剪,
+    //   因此切分与归约语义自洽; 非 DCP 的 S2 上界与 DCP 不同, 不在 A2/A3 上启用。
+    // - 仅限 cmp_ratio==1: 压缩路径 + FD 尚未验证。
+    bool enableFdCurrentScene = (validSocVersion == ValidSocVersion::ASCEND950) ||
+                                ((validSocVersion == ValidSocVersion::ASCEND910B) && (enableDcp_ != 0) &&
+                                 (cmpRatio_ == 1U));
+    if (enableFdCurrentScene) {
         if (maxS2Size_ < static_cast<uint32_t>(topk_)) {
             supportFd_ = false;
             return;

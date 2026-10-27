@@ -280,8 +280,8 @@ int main()
         context.cuSeqlensQOptional.data, context.cuSeqlensKOptional.data, context.sequsedQOptional.data,
         context.sequsedKOptional.data, context.cmpResidualKOptional.data, context.numHeadsQ, context.numHeadsK,
         context.headDim, context.topk, context.quantMode, context.batchSize, context.maxSeqlenQ, context.maxSeqlenK,
-        context.layoutQOptional, context.layoutKOptional, context.maskMode, context.cmpRatio, context.metadata.data,
-        &workspaceSize, &executor);
+        context.layoutQOptional, context.layoutKOptional, context.maskMode, context.cmpRatio, 0,
+        context.metadata.data, &workspaceSize, &executor);
     CHECK_LOG_RET(ret == ACL_SUCCESS, ret, "aclnnQuantLightningIndexerV2MetadataGetWorkspaceSize failed. ERROR: %d\n",
                   ret);
 

@@ -39,6 +39,9 @@ REG_OP(VllmAscendQuantLightningIndexerV2Metadata)
     .ATTR(layout_k, String, "BSND")
     .ATTR(mask_mode, Int, 0)
     .ATTR(cmp_ratio, Int, 1)
+    // DCP (Decode Context Parallel, 解码上下文并行) 开关: 仅 arch22 的场景语义;
+    // FD/LD (Flash Decode, 跨核 S2 切分 + TopK 归约) 在 A2/A3 上仅当该开关为 1 时打开。
+    .ATTR(enable_dcp, Int, 0)
     .ATTR(aic_core_num, Int, 0)
     .ATTR(aiv_core_num, Int, 0)
     .ATTR(soc_version, String, "")

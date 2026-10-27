@@ -107,7 +107,7 @@ def dcp_visible_len(global_end, q_len, row_idx, local_len, cp_world, cp_rank, cp
     return min(local_len, full_rounds + tail)
 
 
-def _build_metadata(case, topk, mask_mode=3):
+def _build_metadata(case, topk, mask_mode=3, enable_dcp=False):
     ops = _qli_ops()
     return getattr(ops, _meta_op_name())(
         num_heads_q=N1,
@@ -124,6 +124,8 @@ def _build_metadata(case, topk, mask_mode=3):
         layout_k="PA_BBND",
         mask_mode=mask_mode,
         cmp_ratio=1,
+        # FD/LD 在 A2/A3 上只对 DCP 场景打开, metadata 需要知道当前是否 DCP。
+        enable_dcp=int(bool(enable_dcp)),
     )
 
 
@@ -203,7 +205,7 @@ def _make_case(cp_world, cp_rank, cp_interleave, batch_size, q_len, causal_lens,
 def _run_op(case, cp_world=1, cp_rank=0, cp_interleave=1, mask_mode=3, enable_dcp=True, return_value=1,
             idx_offset=None):
     ops = _qli_ops()
-    metadata = _build_metadata(case, case["topk"], mask_mode).npu()
+    metadata = _build_metadata(case, case["topk"], mask_mode, enable_dcp=enable_dcp).npu()
     return getattr(ops, _indexer_op_name())(
         case["query"].npu(),
         case["key_pool"].npu(),

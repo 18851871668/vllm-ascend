@@ -512,9 +512,15 @@ aclnnStatus ParamsCheckQliV2(const aclTensor *cuSeqlensQOptional, const aclTenso
                              const aclTensor *cmpResidualKOptional, int64_t numHeadsQ, int64_t numHeadsK,
                              int64_t headDim, int64_t topk, int64_t quantMode, int64_t batchSize, int64_t maxSeqlenQ,
                              int64_t maxSeqlenK, char *layoutQOptional, char *layoutKOptional, int64_t maskMode,
-                             int64_t cmpRatio, const aclTensor *metadata, uint32_t aicCoreNum, uint32_t aivCoreNum,
-                             const std::string &socVersion)
+                             int64_t cmpRatio, int64_t enableDcp, const aclTensor *metadata, uint32_t aicCoreNum,
+                             uint32_t aivCoreNum, const std::string &socVersion)
 {
+    // enable_dcp 仅允许 0/1; 该开关只用于 arch22 上打开 FD/LD, 不影响非 DCP 调用。
+    if ((enableDcp != 0) && (enableDcp != 1)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(QLI_V2_ACLNN_OP_NAME, "enable_dcp", std::to_string(enableDcp),
+                                              "The value of enable_dcp should be 0 or 1");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
     auto ret =
         CheckSingleParamQliV2(numHeadsQ, numHeadsK, headDim, topk, quantMode, batchSize, maxSeqlenQ, maxSeqlenK,
                               layoutQOptional, layoutKOptional, maskMode, cmpRatio, aicCoreNum, aivCoreNum, socVersion);

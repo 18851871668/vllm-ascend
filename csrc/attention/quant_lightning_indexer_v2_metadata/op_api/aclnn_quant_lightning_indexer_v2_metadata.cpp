@@ -38,7 +38,8 @@ extern "C" {
 // existing VA QLI metadata aclnn path.
 static aclnnStatus ParamsCheckQliV2(
     const aclTensor *, const aclTensor *, const aclTensor *, const aclTensor *, const aclTensor *, int64_t, int64_t,
-    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, char *, char *, int64_t, int64_t, const aclTensor *, uint32_t,
+    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, char *, char *, int64_t, int64_t, int64_t,
+    const aclTensor *, uint32_t,
     uint32_t, const std::string &)
 {
     return ACLNN_SUCCESS;
@@ -48,8 +49,8 @@ aclnnStatus aclnnVllmAscendQuantLightningIndexerV2MetadataGetWorkspaceSize(
     const aclTensor *cuSeqlensQOptional, const aclTensor *cuSeqlensKOptional, const aclTensor *sequsedQOptional,
     const aclTensor *sequsedKOptional, const aclTensor *cmpResidualKOptional, int64_t numHeadsQ, int64_t numHeadsK,
     int64_t headDim, int64_t topk, int64_t quantMode, int64_t batchSize, int64_t maxSeqlenQ, int64_t maxSeqlenK,
-    char *layoutQOptional, char *layoutKOptional, int64_t maskMode, int64_t cmpRatio, const aclTensor *metadata,
-    uint64_t *workspaceSize, aclOpExecutor **executor)
+    char *layoutQOptional, char *layoutKOptional, int64_t maskMode, int64_t cmpRatio, int64_t enableDcp,
+    const aclTensor *metadata, uint64_t *workspaceSize, aclOpExecutor **executor)
 {
     if (workspaceSize == nullptr) {
         OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "workspaceSize is nullptr");
@@ -62,7 +63,7 @@ aclnnStatus aclnnVllmAscendQuantLightningIndexerV2MetadataGetWorkspaceSize(
     L2_DFX_PHASE_1(aclnnVllmAscendQuantLightningIndexerV2Metadata,
                    DFX_IN(cuSeqlensQOptional, cuSeqlensKOptional, sequsedQOptional, sequsedKOptional,
                           cmpResidualKOptional, numHeadsQ, numHeadsK, headDim, topk, quantMode, batchSize, maxSeqlenQ,
-                          maxSeqlenK, layoutQOptional, layoutKOptional, maskMode, cmpRatio),
+                          maxSeqlenK, layoutQOptional, layoutKOptional, maskMode, cmpRatio, enableDcp),
                    DFX_OUT(metadata));
 
     auto uniqueExecutor = CREATE_EXECUTOR();
@@ -75,8 +76,8 @@ aclnnStatus aclnnVllmAscendQuantLightningIndexerV2MetadataGetWorkspaceSize(
 
     auto ret = ParamsCheckQliV2(cuSeqlensQOptional, cuSeqlensKOptional, sequsedQOptional, sequsedKOptional,
                                 cmpResidualKOptional, numHeadsQ, numHeadsK, headDim, topk, quantMode, batchSize,
-                                maxSeqlenQ, maxSeqlenK, layoutQOptional, layoutKOptional, maskMode, cmpRatio, metadata,
-                                aicCoreNum, aivCoreNum, socVersion);
+                                maxSeqlenQ, maxSeqlenK, layoutQOptional, layoutKOptional, maskMode, cmpRatio, enableDcp,
+                                metadata, aicCoreNum, aivCoreNum, socVersion);
     CHECK_RET(ret == ACLNN_SUCCESS, ret);
 
     const aclTensor *cuSeqlensQOptionalContiguous = nullptr;
@@ -123,8 +124,8 @@ aclnnStatus aclnnVllmAscendQuantLightningIndexerV2MetadataGetWorkspaceSize(
     auto output = l0op::QuantLightningIndexerV2Metadata(
         cuSeqlensQOptionalContiguous, cuSeqlensKOptionalContiguous, sequsedQOptionalContiguous,
         sequsedKOptionalContiguous, cmpResidualLKOptionalContiguous, numHeadsQ, numHeadsK, headDim, topk, quantMode,
-        batchSize, maxSeqlenQ, maxSeqlenK, layoutQOptional, layoutKOptional, maskMode, cmpRatio, aicCoreNum, aivCoreNum,
-        socVersion.c_str(), metadata, uniqueExecutor.get());
+        batchSize, maxSeqlenQ, maxSeqlenK, layoutQOptional, layoutKOptional, maskMode, cmpRatio, enableDcp, aicCoreNum,
+        aivCoreNum, socVersion.c_str(), metadata, uniqueExecutor.get());
     CHECK_RET(output != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();

@@ -212,16 +212,17 @@ uint32 cpInterleaveSize;
 
 ### 4.3 多核切分不变性
 
-arch22 的 metadata 算子（`quant_lightning_indexer_v2_metadata`）只按 `bN2/gS1` 给核分配任务，`s2End` 恒为 0（`supportFd_` 仅 950 为真），kernel 侧 `CalcS2LoopParams()` 在 `s2End==0` 时用 `GetS2BaseBlockNumOnMask()` 自算块数。因此：
+arch22 的 metadata 算子（`quant_lightning_indexer_v2_metadata`）只按 `bN2/gS1` 给核分配任务。`supportFd_`（是否做 FD/LD 的 S2 跨核切分）在 A2/A3 上由新增的 `enable_dcp` 属性控制：仅当 `enable_dcp=1` 且 `cmp_ratio=1` 时打开，950 维持原有判断（仅 SoC 相关）。
 
-- **DCP 不需要修改 metadata 算子**；
-- 核间负载均衡使用的是非 DCP 的 cost 估计，DCP 下可能不最优（各 rank 实际可见长度不同），但不影响正确性；作为后续性能项（§10）。
+- **这是唯一的 metadata 接口变化**：`enable_dcp` 只作为 FD/LD 的开关，不参与 `bN2/gS1/s2` 的任何切分计算；metadata 仍按本地完整 `L` 计算 `s2Start/s2End`。
+- 该切分是 DCP 可见范围的**超集**（每个 rank 的本地 `L` 就是分到它的 token 数，DCP 可见长度 ≤ `L`），所以不会漏块；kernel 侧按行内绝对可见前缀在段内裁剪。
+- 核间负载均衡仍使用非 DCP 的 cost 估计，DCP 下可能不最优，但不影响正确性；作为后续性能项（§10）。
 
-arch35（950）的 FD/LD 会把 metadata 的 `s2End` 当权威上界，DCP 必须先让 metadata AICPU 感知 `C/P/r/S`，否则按非 DCP 上界切块会漏算——本期不做。
+arch35（950）的 FD/LD 会把 metadata 的 `s2End` 当权威上界；950 的 DCP 支持仍需让 metadata 感知 `C/P/r/S` 并产出 DCP 版切分——本期不做（950 上 DCP 本就未开启）。
 
 ### 4.4 Workspace
 
-无增量。arch22 的 workspace 仍为 `2*s1*s2*4B + w workspace + V1_DECODE` 区域。
+无增量。arch22 的 workspace 仍为 `2*s1*s2*4B + w workspace + V1_DECODE` 区域；FD/LD 打开时沿用既有 `vec1ResGm` LD 归约区（metadata 给出 `workspaceNum`、每段 workspace 下标），没有为 DCP 新增区域。
 
 ---
 
@@ -292,7 +293,9 @@ DCP 下 `L > 0` 但某行 `visible_len == 0` 是常态（Q 片段尚未轮转到
 - 在 `CleanInvalidOutput()` 内补写 `sparse_values = -inf`；
 - 新增的每行 `cuRealAcSeq` 计算保证该分支在 DCP 下能被正确触发（非 DCP 路径不变）。
 
-arch22 上 `isNeedLD` 恒为 false（metadata `s2Start/s2End` 为 0），因此不需要为零可见行补 LD workspace 条目；代码中加注释固化该前提。
+DCP 打开 FD/LD 后（见 §4.3，A2/A3 上 `enable_dcp=1 && cmp_ratio=1`，且 `maxS2 >= topk`、`maxS2 > 5*2048`），`isNeedLD` 可能为 true。此时零可见行必须把初始化好的 `-inf/-1` 缓冲写到 `vec1ResGm` 的 LD workspace（`ProcessVec1()` 的 `cuRealAcSeq <= 0` 分支已有 `isNeedLD && isLastS2InnerLoop` 的写 workspace 路径），由归约核 `ProcessLD()` 合并后输出。同理，行有可见 token 但本核整段超出可见前缀时（`cuS2Len <= 0`）也写当前 partial。三条分支在 LD 下都只写 workspace、不直接写 GM，不会漏行也不会重复覆盖。
+
+FD/LD 关闭时（950 以外默认、或 `cmp_ratio>1`）保持原逻辑：`isNeedLD=false`，零可见行直接 `CleanInvalidOutput()` 写 GM。
 
 ### 5.6 arch22 `return_value=1`
 
@@ -323,6 +326,26 @@ arch22 上 `isNeedLD` 恒为 false（metadata `s2Start/s2End` 为 0），因此�
 - 值输出每行新增一次 `Extract` + 一次 `Cast` + 一次 copy-out，估计矢量耗时 +1% 量级；
 - rank `r>0` 的可见长度通常远小于 `L`，块级遍历块数下降，整体是净收益；
 - `enable_dcp=false` 分支不改变任何指令路径。
+
+### 5.9 FD/LD 的打开条件（A2/A3 仅 DCP）
+
+`quant_lightning_indexer_v2_metadata` 新增属性 `enable_dcp`（Int，默认 0），AICPU 的 FD/LD 门禁为：
+
+| SoC | 打开条件 |
+|---|---|
+| 950 | 保持原有行为（只看 SoC 与 S2 阈值，不看 `enable_dcp`） |
+| A2/A3（910B/910_93） | `enable_dcp=1` 且 `cmp_ratio=1`，并满足 `maxS2 >= topk`、`maxS2 > 5×2048` |
+
+理由：DCP 下每核拿到的是本地完整 `L` 上的连续 S2 段，行内可见前缀是绝对长度、段内自行裁剪，切分与归约语义自洽；非 DCP 调用在 A2/A3 上保持“不打开”，避免把 DCP 的可见长度假设带到普通调用。
+
+实测（910B3，20 步稳态，`torch_npu.profiler`，同一 shape 交替 `enable_dcp` 触发 FD 开关）：
+
+| 用例 | FD/LD 关 | FD/LD 开 |
+|---|---|---|
+| DCP8（本地 L=23,040，B=32、Q=1、N1=32、topk=1024） | 114.1us | 104.4us（−8.5%） |
+| 单 rank 全上下文（L=184,320，**非 DCP 对照**） | 867.7us | 717.4us（−17.3%） |
+
+> 全上下文那行是“实验性全量打开 FD”时的数据，仅说明 LD 机制的收益上限；按本节门禁，A2/A3 的非 DCP 调用不再打开 LD。A3（910_93）本机无设备，未实测。
 
 ---
 
@@ -445,7 +468,16 @@ arch22 上 `isNeedLD` 恒为 false（metadata `s2Start/s2End` 为 0），因此�
 | DCP + `mask_mode=0` | 通过 |
 | 非 DCP 回归（3 组）：`enable_dcp=false` 与 `P=1` DCP 逐位一致，`return_value=0` 时 values 为空 | 通过 |
 | 非 DCP `return_value=1`：index 集合与 BF16 score 对齐 golden | 通过 |
-| 合计 | **15 passed** |
+| FD/LD 门禁（`enable_dcp` 属性）：非 DCP 长 S2（L=16384）QLD 使能核数 0；DCP 长 S2（L=16384，P=8）为 1；DCP 短 S2（L=8192）为 0 | 通过 |
+| FD/LD 打开后的 DCP：`P=8/S=128/C=131072`（本地 L=16384）index/score 与 golden 一致 | 通过 |
+| 合计 | **19 passed**（15 DCP + 4 offset） |
+
+FD/LD 门禁调整后的耗时复核（910B3，NPU1，bulk 50 次取中位，含约 6–9us 启动开销）：
+
+| 用例 | 端到端 median | kernel median（profiler） |
+|---|---|---|
+| DCP8（L=23,040，P=8） | 110.8us | 104.4us |
+| 非 DCP 全上下文（L=184,320） | 876.7us | 867.7us（与 LD 关闭基线一致） |
 
 大 shape 验证中的一个重要结论（风险 R1 的实测确认）：`P=8/S=128/C=16384` 的合并结果与 `P=1` 参考在 1024 个 TopK 成员中相差 4 个，诊断显示这 4 个成员在 BF16 下分数**全部等于边界值 1368.0**，其 FP32 真实分数为 1364.1–1371.6，跨在真实边界 1364.7 两侧。`P=1` 算子输出与 FP32 真值 TopK **完全一致**（0 缺失/0 多余），单 rank 输出也与本地 golden 一致。因此这是 BF16 分数在边界并列导致的成员选择差异，不是 kernel 错误。测试断言已改为：边界以上成员必须完全一致，对称差只允许落在边界的一个 BF16 量化步长内。
 
@@ -464,5 +496,7 @@ python -m pytest -q csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_
 |---|---|
 | host UT | 用例已加入 `tests/ut/op_host/arch22/...`，但本 clone 缺 `tests/ut/framework_normal`，无法在本仓构建；需在完整 ops-transformer 仓执行 |
 | candidate 模式 | 本次未改 candidate 内核路径（`dcpEnable=false`、`valueOutBuf_` 不分配），最小验证扩展固定 `candidate_mode=3`；完整回归需在 ops-transformer 的 candidate 套件执行 |
+| A3（910_93） | FD/LD 门禁与 arch22 代码路径相同，但本机无 A3 设备，未实测；需在 A3 上用同一脚本复测 |
+| 非 DCP + FD | 按 5.9 的门禁，A2/A3 的非 DCP 调用不再打开 FD/LD；`cmp_ratio>1` 的压缩路径同样不打开 |
 | 框架侧 pip 接入 | 不在本期（见 §6 契约） |
 | arch35（950） | 不支持，需先扩展 metadata AICPU（§4.3） |

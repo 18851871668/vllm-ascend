@@ -27,7 +27,8 @@ at::Tensor QuantLightningIndexerMetadata(int64_t numHeadsQ, int64_t numHeadsK, i
                                          const c10::optional<at::Tensor> &sequsedK,
                                          const c10::optional<at::Tensor> &cmpResidualK, int64_t batchSize,
                                          int64_t maxSeqlenQ, int64_t maxSeqlenK, c10::string_view layoutQ,
-                                         c10::string_view layoutK, int64_t maskMode, int64_t cmpRatio)
+                                         c10::string_view layoutK, int64_t maskMode, int64_t cmpRatio,
+                                         int64_t enableDcp = 0)
 {
     at::Device outputDevice = at::Device(std::string("npu"));
     if (cuSeqlensQ.has_value()) {
@@ -57,7 +58,7 @@ at::Tensor QuantLightningIndexerMetadata(int64_t numHeadsQ, int64_t numHeadsK, i
     if (output.device().is_meta()) return output;
     EXEC_NPU_CMD(aclnnVllmAscendQuantLightningIndexerV2Metadata, cuSeqlensQVal, cuSeqlensKVal, sequsedQVal, sequsedKVal,
               cmpResidualKVal, numHeadsQ, numHeadsK, headDim, topk, quantMode, batchSize, maxSeqlenQ, maxSeqlenK,
-              layoutQPtr, layoutKPtr, maskMode, cmpRatio, output);
+              layoutQPtr, layoutKPtr, maskMode, cmpRatio, enableDcp, output);
     return output;
 }
 

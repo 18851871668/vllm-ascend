@@ -297,6 +297,8 @@ private:
     std::string layoutK_ = "BSND";
     int32_t maskMode_ = 0;
     int32_t cmpRatio_ = 1;
+    // DCP (Decode Context Parallel, 解码上下文并行) 开关; 1 表示主算子走 DCP 场景。
+    int32_t enableDcp_ = 0;
     uint32_t attentionMode_ = 0;
 
     // SplitParams
