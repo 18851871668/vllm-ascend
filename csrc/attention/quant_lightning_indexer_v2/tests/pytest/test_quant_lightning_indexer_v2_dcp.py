@@ -200,7 +200,8 @@ def _make_case(cp_world, cp_rank, cp_interleave, batch_size, q_len, causal_lens,
     }
 
 
-def _run_op(case, cp_world=1, cp_rank=0, cp_interleave=1, mask_mode=3, enable_dcp=True, return_value=1):
+def _run_op(case, cp_world=1, cp_rank=0, cp_interleave=1, mask_mode=3, enable_dcp=True, return_value=1,
+            idx_offset=None):
     ops = _qli_ops()
     metadata = _build_metadata(case, case["topk"], mask_mode).npu()
     return getattr(ops, _indexer_op_name())(
@@ -214,6 +215,7 @@ def _run_op(case, cp_world=1, cp_rank=0, cp_interleave=1, mask_mode=3, enable_dc
         cu_seqlens_q=case["cu_seqlens_q"].npu(),
         seqused_k=case["seqused_k"].npu(),
         block_table=case["block_table"].npu(),
+        output_idx_offset=idx_offset.npu() if idx_offset is not None else None,
         metadata=metadata,
         max_seqlen_q=case["q_len"],
         layout_q="TND",
@@ -316,7 +318,7 @@ def _compare_rank(case, cp_world, cp_rank, cp_interleave):
     gold, gold_values = _run_golden(case, cp_world, cp_rank, cp_interleave)
     gold = gold[:, 0, :]
     gold_values = gold_values[:, 0, :].astype(np.float32)
-    scores = _row_scores(case, cp_world, cp_rank, cp_interleave)
+    scores = None  # 仅在索引集合不一致 (并列边界) 时按需重建, 避免大 shape 重复计算
 
     for row in range(out.shape[0]):
         pred = out[row][out[row] >= 0]
@@ -326,6 +328,8 @@ def _compare_rank(case, cp_world, cp_rank, cp_interleave):
             continue
         pred_set, ref_set = set(pred.tolist()), set(ref.tolist())
         if pred_set != ref_set:
+            if scores is None:
+                scores = _row_scores(case, cp_world, cp_rank, cp_interleave)
             # 并列边界: 只允许"被替换成员与参考边界同分"
             only_pred = sorted(pred_set - ref_set)
             only_ref = sorted(ref_set - pred_set)
@@ -336,17 +340,19 @@ def _compare_rank(case, cp_world, cp_rank, cp_interleave):
                         f"row {row}: index set mismatch pred-only={i} ref-only={j} "
                         f"score_pred={scores[row, i]} score_ref={scores[row, j]} boundary={boundary}"
                     )
-        # score 校验: 取算子返回的 index 在重建分数里的值, 与返回 score 对齐
-        valid = out[row] >= 0
-        if valid.any():
-            expect = scores[row][out[row][valid]]
-            got = values[row][valid]
-            np.testing.assert_allclose(got, expect, rtol=2e-2, atol=2e-3)
+        # score 校验: 用 golden 的 (index -> value) 映射, 不重建整行分数
+        ref_map = {int(i): float(v) for i, v in zip(ref, gold_values[row][gold[row] >= 0])}
+        for pos, idx in enumerate(out[row]):
+            if idx < 0:
+                continue
+            ref_v = ref_map.get(int(idx))
+            if ref_v is not None:
+                np.testing.assert_allclose(float(values[row][pos]), ref_v, rtol=2e-2, atol=2e-3)
     return out, values
 
 
 def _merge_global_per_row(rank_outputs, cp_world, cp_interleave, topk):
-    """按行合并各 rank 的 (score, local_idx), 返回每行的全局 TopK 集合."""
+    """按行合并各 rank 的 (score, local_idx), 返回每行的 {global_idx: score} TopK."""
     num_rows = rank_outputs[0][0].shape[0]
     merged_rows = []
     for row in range(num_rows):
@@ -357,7 +363,7 @@ def _merge_global_per_row(rank_outputs, cp_world, cp_interleave, topk):
                     continue
                 cand.append((float(score), int(dcp_global_index(int(local_idx), cp_world, rank, cp_interleave))))
         cand.sort(key=lambda x: (-x[0], x[1]))  # 稳定排序: score 降序, 并列取更小全局序号
-        merged_rows.append({g for _, g in cand[:topk]})
+        merged_rows.append({g: s for s, g in cand[:topk]})
     return merged_rows
 
 
@@ -369,6 +375,11 @@ CASES = [
     (2, 128, 2, 1, [129, 257], 512),
     (4, 128, 1, 1, [127], 512),   # 末 rank L=0
     (2, 64, 1, 4, [513], 2048),
+    # 大 shape: P=8/16, 本地 L=2048/4096, topk 真正参与筛选
+    (8, 128, 1, 4, [16384], 1024),
+    (16, 128, 1, 4, [32768], 1024),
+    (8, 256, 1, 2, [32768], 2048),
+    (16, 1, 1, 4, [8192], 256),
 ]
 
 
@@ -384,14 +395,27 @@ def test_qliv2_dcp(cp_world, cp_interleave, batch_size, q_len, causal_lens, topk
         idx, val = _compare_rank(case, cp_world, rank, cp_interleave)
         rank_outputs.append((idx, val))
 
-    # 多 rank 合并 == 同一全局序列按 P=1 的结果 (全局 topk 精确等价)
-    merged_rows = _merge_global_per_row(rank_outputs, cp_world, cp_interleave, topk)
+    # 多 rank 合并 == 同一全局序列按 P=1 的结果 (边界 BF16 并列容忍)
+    merged_maps = _merge_global_per_row(rank_outputs, cp_world, cp_interleave, topk)
     ref_case = _make_case(1, 0, 1, batch_size, q_len, causal_lens, topk, seed=0)
-    ref_out, _ = _run_op(ref_case, 1, 0, 1)
+    ref_out, ref_val = _run_op(ref_case, 1, 0, 1)
     ref_out = ref_out.cpu().numpy()[:, 0, :]
-    for row, merged in enumerate(merged_rows):
-        ref = set(ref_out[row][ref_out[row] >= 0].tolist())
-        assert merged == ref, f"row {row}: merged global topk != P=1 topk, diffs={sorted(merged ^ ref)}"
+    ref_val = ref_val.cpu().float().numpy()[:, 0, :]
+    for row, merged_map in enumerate(merged_maps):
+        ref_map = {int(g): float(s) for g, s in zip(ref_out[row], ref_val[row]) if g >= 0}
+        assert len(merged_map) == len(ref_map), f"row {row}: topk count {len(merged_map)} != {len(ref_map)}"
+        boundary = min(min(merged_map.values(), default=0.0), min(ref_map.values(), default=0.0))
+        # 边界以上 (不含并列带) 必须完全一致
+        above_merged = {g for g, s in merged_map.items() if s > boundary}
+        above_ref = {g for g, s in ref_map.items() if s > boundary}
+        assert above_merged == above_ref, f"row {row}: above-boundary topk mismatch, diffs={sorted(above_merged ^ above_ref)}"
+        # 对称差只允许是边界并列成员 (BF16 量化后同分)
+        tie_step = max(abs(boundary) * 2.0 ** -8, 1e-6)  # BF16 相对精度 ~2^-8
+        for g in set(merged_map) ^ set(ref_map):
+            score = merged_map.get(g, ref_map.get(g))
+            assert abs(score - boundary) <= tie_step, (
+                f"row {row}: non-tie diff global={g} score={score} boundary={boundary}"
+            )
 
 
 @pytest.mark.ci
@@ -446,4 +470,31 @@ def test_qliv2_non_dcp_return_value():
         ref_map = {int(i): float(v) for i, v in zip(ref, gold_val[row][gold[row] >= 0])}
         for i, v in zip(idx[row][idx[row] >= 0], val[row][idx[row] >= 0]):
             np.testing.assert_allclose(float(v), ref_map[int(i)], rtol=2e-2, atol=2e-3)
+
+
+@pytest.mark.ci
+@pytest.mark.parametrize("local_len,offset", [(1, 7), (17, 7), (17, 100000), (257, 0)])
+def test_qliv2_output_idx_offset_padding(local_len, offset):
+    """arch22 A16: offset 只作用于有效 index, padding 必须保持字面 -1 (对齐 arch35)."""
+    _require_npu()
+    case = _make_case(1, 0, 1, 1, 1, [local_len], 512, seed=0)
+    off = torch.tensor([[offset]], dtype=torch.int32)
+    idx, val = _run_op(case, 1, 0, 1, enable_dcp=False, return_value=1, idx_offset=off)
+    idx = idx.cpu().numpy()[:, 0, :]
+    val = val.cpu().float().numpy()[:, 0, :]
+    n = min(512, local_len)
+    row = idx[0]
+    valid, tail = row[:n], row[n:]
+    assert (tail == -1).all(), f"padding 必须是字面 -1, 实际前几个: {tail[:8]}"
+    assert np.isneginf(val[0][n:]).all(), "padding 的 value 必须是 -inf"
+    assert len(set(valid.tolist())) == n, "有效 index 不应重复"
+    if offset == 0:
+        assert (valid >= 0).all() and (valid < local_len).all()
+    else:
+        assert (valid >= offset).all() and (valid < offset + local_len).all()
+    # 有效 index 与真值分数对齐 (offset 不影响选值, 只是平移 index)
+    scores = _row_scores(case, 1, 0, 1)[0]
+    for pos, gi in enumerate(valid):
+        li = int(gi) - offset
+        np.testing.assert_allclose(val[0][pos], scores[li], rtol=2e-2, atol=2e-3)
 

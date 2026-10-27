@@ -734,12 +734,12 @@ template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec0(const QLIV2Common::RunInfo &info)
 {
     // 只需要一个v核做
-    if (blockId_ % 2 != 0) {
+    if ((blockId_ & 1) != 0) {
         return;
     }
     int32_t cuBaseS1Idx = info.gS1Idx * s1BaseSize_;
     // 计算输出w基地址偏移 偶数循环 -> 0 + aic_offset  奇数循环 -> 4*64 + aic_offset
-    int64_t vec0OutGmOffset = (info.loop % 2) * ((s1BaseSize_ * gSize_ * BLOCK_CUBE));
+    int64_t vec0OutGmOffset = ((info.loop & 1)) * ((s1BaseSize_ * gSize_ * BLOCK_CUBE));
     // 计算输入weight的地址偏移，qScale的地址偏移与weight相同
     int64_t weightGmOffset = info.tensorWeightsOffset + cuBaseS1Idx * qHeadNum_;
     // 当前需要计算的S1行数，处理尾块场景
@@ -799,17 +799,17 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
     int32_t cuBaseS2Idx = info.s2Idx * s2BaseSize_;
 
     // 计算基本块基地址偏移 偶数循环 -> 0 + aic_offset  奇数循环 -> 4*2048 + aic_offset
-    int64_t mmGmOffset = (info.loop % 2) * (s1BaseSize_ * s2BaseSize_);
+    int64_t mmGmOffset = ((info.loop & 1)) * (s1BaseSize_ * s2BaseSize_);
 
     // cuS1BeginIdxPerAiv: 每个AIV的S1起始偏移
     int32_t cuS1BeginIdxPerAiv = cuBaseS1Idx;
     int32_t cuS1ProcNum =
         cuS1BeginIdxPerAiv + s1BaseSize_ > info.actS1Size ? info.actS1Size % s1BaseSize_ : s1BaseSize_;
     // cuS1ProcNumPerAiv: 每个AIv的S1计算量
-    int32_t cuS1ProcNumPerAiv = blockId_ % 2 == 0 ? CeilDiv(cuS1ProcNum, 2) : (cuS1ProcNum / 2);
-    cuS1BeginIdxPerAiv += (blockId_ % 2) * CeilDiv(cuS1ProcNum, 2);
+    int32_t cuS1ProcNumPerAiv = (blockId_ & 1) == 0 ? CeilDiv(cuS1ProcNum, 2) : (cuS1ProcNum / 2);
+    cuS1BeginIdxPerAiv += ((blockId_ & 1)) * CeilDiv(cuS1ProcNum, 2);
     // 基本块基地址偏移奇数核加一个S1地址偏移
-    mmGmOffset += (blockId_ % 2) * CeilDiv(cuS1ProcNum, 2) * s2BaseSize_;
+    mmGmOffset += ((blockId_ & 1)) * CeilDiv(cuS1ProcNum, 2) * s2BaseSize_;
     // 非首个基本块, M(S1)轴发生切换需要初始化
     if (info.loop != 0 && info.s2Idx == 0) {
         // globalTopkUb_ value,index=-inf,-1
@@ -831,7 +831,7 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
     int32_t cuRealAcSeqIni = cuRealAcSeq;
 
     // LD输出S1方向偏移，保证2个Vector输出的内容连续
-    uint32_t ldS1Offset = (blockId_ % 2 == 0) ? s1BaseSize_ / 2 - cuS1ProcNumPerAiv : 0;
+    uint32_t ldS1Offset = ((blockId_ & 1) == 0) ? s1BaseSize_ / 2 - cuS1ProcNumPerAiv : 0;
     for (int innerS1Idx = 0; innerS1Idx < cuS1ProcNumPerAiv; innerS1Idx++) {
         if (constInfo_.dcpEnable && constInfo_.attenMaskFlag) {
             // DCP (Decode Context Parallel, 解码上下文并行): mask_mode=3 时每行现算
@@ -941,11 +941,22 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
                     int32_t rowOff = outputIdxOffsetGm_.GetValue(info.outputIdxOffsetCoreOffset +
                                                                  cuS1Idx * kHeadNum_);
                     if (rowOff != 0) {
+                        // A16: offset 只作用于有效 index, [validNum, sparseCount) 的 padding 保持 -1。
+                        // validNum = 本行真实候选数 = min(topk, 可见长度); 不能用扫描 -1 反推,
+                        // 因为加偏移后 -1 已不可辨。只写有效前缀, 尾部自然保持 Extract 时的 -1,
+                        // 避免从非 32B 对齐地址做 Duplicate (会触发 aicore 异常)。
+                        int32_t validNum = Min(static_cast<int32_t>(constInfo_.sparseCount), Max(cuRealAcSeq, 0));
                         LocalTensor<int32_t> idxI32 = idxULocal.template ReinterpretCast<int32_t>();
-                        for (int32_t off = 0; off < constInfo_.sparseCount; off += 64) {
+                        int32_t off = 0;
+                        for (; off + 64 <= validNum; off += 64) {
                             Adds(idxI32[off], idxI32[off], rowOff, 64);
                         }
-                        PipeBarrier<PIPE_V>();
+                        if (off < validNum) {
+                            Adds(idxI32[off], idxI32[off], rowOff, validNum - off);
+                        }
+                        if (validNum > 0) {
+                            PipeBarrier<PIPE_V>();
+                        }
                     }
                 }
                 InitSortOutBuf(globalTopkUb_[innerS1Idx * BASE_TOPK_VALUE_IDX_SIZE], BASE_TOPK_VALUE_IDX_SIZE);
@@ -1015,8 +1026,8 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
         int32_t invalidS1Num = constInfo_.qSeqSize - info.actS1Size;
         // blockS2StartIdx_ == 0 控制S2从开始的核去做冗余清理
         if (invalidS1Num > 0 && isS1LoopEnd && blockS2StartIdx_ == 0) {
-            int32_t s1NumPerAiv = blockId_ % 2 == 0 ? CeilDiv(invalidS1Num, 2) : (invalidS1Num / 2);
-            int32_t s1OffsetPerAiv = info.actS1Size + (blockId_ % 2) * CeilDiv(invalidS1Num, 2);
+            int32_t s1NumPerAiv = (blockId_ & 1) == 0 ? CeilDiv(invalidS1Num, 2) : (invalidS1Num / 2);
+            int32_t s1OffsetPerAiv = info.actS1Size + ((blockId_ & 1)) * CeilDiv(invalidS1Num, 2);
             for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
                 CleanInvalidOutput(info.indiceOutOffset + (s1OffsetPerAiv + innerS1Idx) * constInfo_.sparseCount);
             }
@@ -1024,8 +1035,8 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
 
         int32_t invalidS1Num2 = info.actS1Size - info.actS2SizeOrig;
         if (invalidS1Num2 > 0 && isS1LoopEnd && blockS2StartIdx_ == 0 && constInfo_.attenMaskFlag) {
-            int32_t s1NumPerAiv = blockId_ % 2 == 0 ? CeilDiv(invalidS1Num2, 2) : (invalidS1Num2 / 2);
-            int32_t s1OffsetPerAiv = (blockId_ % 2) * CeilDiv(invalidS1Num2, 2);
+            int32_t s1NumPerAiv = (blockId_ & 1) == 0 ? CeilDiv(invalidS1Num2, 2) : (invalidS1Num2 / 2);
+            int32_t s1OffsetPerAiv = ((blockId_ & 1)) * CeilDiv(invalidS1Num2, 2);
             for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
                 CleanInvalidOutput((info.bN2Idx * constInfo_.qSeqSize + s1OffsetPerAiv + innerS1Idx) *
                                    constInfo_.sparseCount);
@@ -1158,10 +1169,25 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
             int32_t rowOff = outputIdxOffsetGm_.GetValue(
                 ldInfo_.indiceOutCoreOffset / constInfo_.sparseCount + rowGlobal * constInfo_.kHeadNum);
             if (rowOff != 0) {
-                for (int32_t off = 0; off < constInfo_.sparseCount; off += 64) {
+                // A16: 与 ProcessVec1 同口径 — 只对有效前缀加偏移, 尾部保持 -1。
+                // LD 当前在 arch22 不触发 (metadata 的 s2End 恒为 0), 该扫描不影响主路径性能。
+                int32_t validNum = static_cast<int32_t>(constInfo_.sparseCount);
+                for (int32_t i = 0; i < static_cast<int32_t>(constInfo_.sparseCount); ++i) {
+                    if (idxULocal1.GetValue(i) < 0) {
+                        validNum = i;
+                        break;
+                    }
+                }
+                int32_t off = 0;
+                for (; off + 64 <= validNum; off += 64) {
                     Adds(idxULocal1[off], idxULocal1[off], rowOff, 64);
                 }
-                PipeBarrier<PIPE_V>();
+                if (off < validNum) {
+                    Adds(idxULocal1[off], idxULocal1[off], rowOff, validNum - off);
+                }
+                if (validNum > 0) {
+                    PipeBarrier<PIPE_V>();
+                }
             }
         }
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
