@@ -107,7 +107,7 @@ def dcp_visible_len(global_end, q_len, row_idx, local_len, cp_world, cp_rank, cp
     return min(local_len, full_rounds + tail)
 
 
-def _build_metadata(case, topk, mask_mode=3, enable_dcp=False):
+def _build_metadata(case, topk, mask_mode=3, enable_dcp=False, cmp_ratio=1):
     ops = _qli_ops()
     return getattr(ops, _meta_op_name())(
         num_heads_q=N1,
@@ -123,7 +123,7 @@ def _build_metadata(case, topk, mask_mode=3, enable_dcp=False):
         layout_q="TND",
         layout_k="PA_BBND",
         mask_mode=mask_mode,
-        cmp_ratio=1,
+        cmp_ratio=cmp_ratio,
         # FD/LD 在 A2/A3 上只对 DCP 场景打开, metadata 需要知道当前是否 DCP。
         enable_dcp=int(bool(enable_dcp)),
     )
@@ -202,10 +202,63 @@ def _make_case(cp_world, cp_rank, cp_interleave, batch_size, q_len, causal_lens,
     }
 
 
+def _pad_case(case, pad_l, seed=0):
+    """把本地 KV 补到 pad_l，模拟框架传入 padding 后的 seqused_k。
+
+    可见长度仍由全局 causal 上界 C 决定，因此当 pad_l 远大于真实可见前缀时，
+    metadata 切出的多数 S2 段对每一行都完全不可见；开 LD 后这些段只能贡献
+    (-inf, -1) 的 partial，最终由归约核合并。
+    """
+    rng = np.random.default_rng(seed + 1)
+    B = case["batch_size"]
+    local_k = np.zeros((B, N2, pad_l, HEAD_DIM), dtype=np.int8)
+    k_scale_logical = np.ones((B, N2, pad_l), dtype=np.float16)
+    for b in range(B):
+        l = int(case["local_lens"][b])
+        local_k[b, 0, :l] = case["local_k"][b, 0, :l].numpy()
+        k_scale_logical[b, 0, :l] = case["k_scale_logical"][b, 0, :l].numpy()
+        if pad_l > l:
+            local_k[b, 0, l:pad_l] = rng.integers(
+                -128, 128, size=(pad_l - l, HEAD_DIM), dtype=np.int16
+            ).astype(np.int8)
+            k_scale_logical[b, 0, l:pad_l] = rng.uniform(0.5, 1.5, size=(pad_l - l,)).astype(np.float16)
+
+    blocks_per_batch = max(1, (pad_l + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    block_num = B * blocks_per_batch
+    key_pool = np.zeros((block_num, BLOCK_SIZE, N2, HEAD_DIM), dtype=np.int8)
+    k_scale_pool = np.ones((block_num, BLOCK_SIZE, N2), dtype=np.float16)
+    block_table = np.zeros((B, blocks_per_batch), dtype=np.int32)
+    perm = rng.permutation(block_num)
+    for b in range(B):
+        perm_b = perm[b * blocks_per_batch:(b + 1) * blocks_per_batch]
+        block_table[b] = perm_b
+        for blk in range(blocks_per_batch):
+            st = blk * BLOCK_SIZE
+            ed = min(st + BLOCK_SIZE, pad_l)
+            key_pool[perm_b[blk], :ed - st, 0] = local_k[b, 0, st:ed]
+            k_scale_pool[perm_b[blk], :ed - st, 0] = k_scale_logical[b, 0, st:ed]
+
+    padded = dict(case)
+    padded.update(
+        {
+            "key_pool": torch.from_numpy(key_pool),
+            "k_scale_pool": torch.from_numpy(k_scale_pool),
+            "block_table": torch.from_numpy(block_table),
+            "local_k": torch.from_numpy(local_k),
+            "k_scale_logical": torch.from_numpy(k_scale_logical),
+            "local_lens": [pad_l] * B,
+            "max_l": pad_l,
+            "seqused_k": torch.tensor([pad_l] * B, dtype=torch.int32),
+        }
+    )
+    return padded
+
+
 def _run_op(case, cp_world=1, cp_rank=0, cp_interleave=1, mask_mode=3, enable_dcp=True, return_value=1,
-            idx_offset=None):
+            idx_offset=None, cmp_ratio=1):
     ops = _qli_ops()
-    metadata = _build_metadata(case, case["topk"], mask_mode, enable_dcp=enable_dcp).npu()
+    metadata = _build_metadata(case, case["topk"], mask_mode, enable_dcp=enable_dcp,
+                               cmp_ratio=cmp_ratio).npu()
     return getattr(ops, _indexer_op_name())(
         case["query"].npu(),
         case["key_pool"].npu(),
@@ -223,7 +276,7 @@ def _run_op(case, cp_world=1, cp_rank=0, cp_interleave=1, mask_mode=3, enable_dc
         layout_q="TND",
         layout_k="PA_BBND",
         mask_mode=mask_mode,
-        cmp_ratio=1,
+        cmp_ratio=cmp_ratio,
         return_value=return_value,
         causal_seqlens_kv_global=case["causal_lens"].npu() if enable_dcp else None,
         enable_dcp=enable_dcp,
@@ -500,3 +553,72 @@ def test_qliv2_output_idx_offset_padding(local_len, offset):
         li = int(gi) - offset
         np.testing.assert_allclose(val[0][pos], scores[li], rtol=2e-2, atol=2e-3)
 
+
+
+@pytest.mark.ci
+@pytest.mark.parametrize(
+    "cp_rank,causal_len,expected_valid",
+    [
+        (0, 1152, 256),   # 可见 256，本地 16384：第 1..7 段完全不可见
+        (1, 1152, 128),   # 可见 128，同上
+        (7, 1152, 128),   # 可见 128，同上
+        (1, 128, 0),      # 本 rank 可见长度为 0：所有段不可见，输出全 -1/-inf
+    ],
+)
+def test_qliv2_dcp_ld_invisible_segments(cp_rank, causal_len, expected_valid):
+    """LD 打开 + 本地 L 远大于可见前缀：大量 S2 段对每一行都完全不可见。
+
+    pad_l=16384 超过 FD 阈值 5*2048，metadata 会做 S2 跨核切分；可见长度仍由
+    全局 C 决定（256/128/0），因此切分后多数核只处理不可见段，只能写
+    (-inf, -1) 的 partial，最终由归约核合并。
+    """
+    _require_npu()
+    base = _make_case(8, cp_rank, 128, 1, 1, [causal_len], 512, seed=0)
+    case = _pad_case(base, 16384)
+
+    meta = _build_metadata(case, case["topk"], 3, enable_dcp=True).cpu().numpy()
+    qld = meta[288:288 + 72 * 8].reshape(72, 8)[:, 0]
+    assert (qld == 1).any(), "FD/LD 未打开，用例没有覆盖 LD 归约路径"
+
+    out, values = _compare_rank(case, 8, cp_rank, 128)
+    valid_counts = (out >= 0).sum(axis=1)
+    assert (valid_counts == expected_valid).all(), f"valid count {valid_counts} != {expected_valid}"
+    if expected_valid == 0:
+        assert (out == -1).all()
+        assert np.isneginf(values).all()
+    else:
+        assert (out[:, :expected_valid] >= 0).all()
+        assert (out[:, expected_valid:] == -1).all()
+        assert (out[:, :expected_valid] < expected_valid).all(), "选到了可见前缀之外的 token"
+
+
+@pytest.mark.ci
+def test_qliv2_ld_gate_non_dcp_vs_dcp():
+    """门禁回归：非 DCP 长 S2 不开 LD；DCP 长 S2 开 LD。"""
+    _require_npu()
+    non_dcp = _make_case(1, 0, 1, 1, 1, [16384], 512, seed=0)
+    m0 = _build_metadata(non_dcp, 512, 3, enable_dcp=False).cpu().numpy()
+    assert ((m0[288:288 + 72 * 8].reshape(72, 8)[:, 0]) == 0).all(), "非 DCP 不应打开 LD"
+
+    dcp = _make_case(8, 0, 128, 1, 1, [131072], 512, seed=0)  # 本地 L=16384
+    m1 = _build_metadata(dcp, 512, 3, enable_dcp=True).cpu().numpy()
+    assert (m1[288:288 + 72 * 8].reshape(72, 8)[:, 0] == 1).any(), "DCP 长 S2 应打开 LD"
+
+
+@pytest.mark.ci
+def test_qliv2_dcp_rejects_output_idx_offset():
+    """DCP 与 output_idx_offset 互斥，必须在 tiling 层拒绝。"""
+    _require_npu()
+    case = _make_case(2, 0, 128, 1, 1, [513], 512, seed=0)
+    off = torch.zeros(case["q_t"], N2, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="output_idx_offset"):
+        _run_op(case, 2, 0, 128, idx_offset=off)
+
+
+@pytest.mark.ci
+def test_qliv2_dcp_rejects_cmp_ratio_gt1():
+    """DCP 与压缩路径互斥（cmp_ratio 必须为 1）。"""
+    _require_npu()
+    case = _make_case(2, 0, 128, 1, 1, [513], 512, seed=0)
+    with pytest.raises(RuntimeError, match="cmp_ratio|cmp_residual_k|enable_dcp"):
+        _run_op(case, 2, 0, 128, mask_mode=0, cmp_ratio=2)

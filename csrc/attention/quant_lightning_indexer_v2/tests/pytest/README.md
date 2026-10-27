@@ -268,6 +268,11 @@ bash batch_isolated_run.sh ./pt_path 1 graph   # graph模式 + 性能采集
 - 多 rank：按 `global = (local // S * P + r) * S + local % S` 转全局并稳定 TopK，结果与同一全局序列按 `P=1` 跑一致；
 - 边界：`C` 落在 `P*S` 边界、末 rank 截断、`L_r=0`、`Q_len>1`、`B>1`、`mask_mode=0/3`、`S=1/16/64/128`；
 - 非 DCP 回归：`enable_dcp=false` 与 `P=1` 的 DCP 结果逐位一致；`return_value=0/1` 行为正确。
+- **DCP + LD 的极端分片**（`test_qliv2_dcp_ld_invisible_segments`）：把 `seqused_k` padding 到 16384
+  （超过 FD 阈值），全局 `C=1152/128` 使可见长度只有 256/128/0，覆盖“某核整段不可见”“零可见行”
+  以及归约缺 partial 的场景；断言有效 index 数等于可见长度、不越出可见前缀、padding 为 `-1/-inf`。
+- FD/LD 门禁回归（`test_qliv2_ld_gate_non_dcp_vs_dcp`）：非 DCP 长 S2 QLD 使能核数为 0，DCP 为 1。
+- 互斥校验：DCP 下传 `output_idx_offset`、或 `cmp_ratio>1`，必须在 tiling 层被拒绝。
 
 运行（自动优先使用 `_C_ascend`，否则回退到 `cann_ops_transformer`）：
 

@@ -602,8 +602,18 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::CalcS2LoopParams(uint32_t bN2LoopId
         s2BlockNum = (tempLoopInfo.actS2Size + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
         tempLoopInfo.validS2Len = tempLoopInfo.actS2Size;
     }
+    // DCP + LD: metadata 按本地完整 L 切 S2, 而本核的可见上界 s2BlockNum 可能远小于这个范围。
+    // 此时 (1) 第一个分片的 s2End 可能 <= s2BlockNum, 不能据此判定"无需归约";
+    //      (2) 最后一个分片的 s2End==0 表示开区间, 终点应是本地完整 L 的块数, 不是可见上界。
+    // 两者都要按 metadata 的切分语义处理, 否则会漏写该分片的 workspace partial。
+    uint32_t metaS2BlockNum = (tempLoopInfo.actS2Size + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
+    bool dcpLdSplit = constInfo.dcpEnable && isEnd &&
+                      ((constInfo.s2Start > 0) || (constInfo.s2End != 0));
     tempLoopInfo.s2LoopEnd = (isEnd && constInfo.s2End != 0) ? constInfo.s2End : s2BlockNum;
-    if (constInfo.s2Start > 0 || tempLoopInfo.s2LoopEnd < s2BlockNum) {
+    if (dcpLdSplit && constInfo.s2End == 0) {
+        tempLoopInfo.s2LoopEnd = metaS2BlockNum;
+    }
+    if ((constInfo.s2Start > 0) || (tempLoopInfo.s2LoopEnd < s2BlockNum) || dcpLdSplit) {
         tempLoopInfo.isNeedLD = true;
     } else {
         tempLoopInfo.isNeedLD = false;

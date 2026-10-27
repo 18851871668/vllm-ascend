@@ -347,6 +347,20 @@ FD/LD 关闭时（950 以外默认、或 `cmp_ratio>1`）保持原逻辑：`isNe
 
 > 全上下文那行是“实验性全量打开 FD”时的数据，仅说明 LD 机制的收益上限；按本节门禁，A2/A3 的非 DCP 调用不再打开 LD。A3（910_93）本机无设备，未实测。
 
+### 5.10 DCP+LD 的分片归属（本地 L 与可见上界不一致）
+
+metadata 按本地完整 `L`（`seqused_k`）切 S2，而 kernel 的可见上界 `s2BlockNum` 由 DCP 公式给出。两者通常相等；但框架若把 `seqused_k` 传成 padding 后的容量（可见长度远小于 L），旧实现会漏写部分 workspace：
+
+- 第一个分片的 `s2End` 可能 `<= s2BlockNum`，旧实现据此判定“本核独占、无需归约”，不做 LD 写回；
+- 最后一个分片 `s2End==0`（开区间），旧实现用 `s2BlockNum` 当终点，`s2Start >= s2BlockNum` 时循环不执行，同样漏写。
+
+漏写的 partial 在 workspace 里是未初始化数据，归约核会把它当成 `(0,0)` 合并，输出出现重复索引和 0 分。修复在 `CalcS2LoopParams`：
+
+- `dcpEnable && isEnd && (s2Start>0 || s2End!=0)` 时按 metadata 语义处理：`s2End != 0` 用它，`s2End == 0` 用 `ceil(actS2Size / s2BaseSize)`（本地完整 L 的块数），不再用可见上界；
+- 该分支强制 `isNeedLD = true`，保证每个分片都写 partial。
+
+正常 DCP 形状（可见≈L）行为与修改前一致，实测耗时不变（110.4us @ topk=1024）；padding 场景由新增用例覆盖（§10.2）。
+
 ---
 
 ## 6. 框架侧契约（本期不改，供对接）
@@ -447,7 +461,7 @@ FD/LD 关闭时（950 以外默认、或 `cmp_ratio>1`）保持原逻辑：`isNe
 
 ---
 
-## 10. 当前验证状态（2026-10-26）
+## 10. 当前验证状态（2026-10-28）
 
 ### 10.1 编译
 
@@ -470,7 +484,9 @@ FD/LD 关闭时（950 以外默认、或 `cmp_ratio>1`）保持原逻辑：`isNe
 | 非 DCP `return_value=1`：index 集合与 BF16 score 对齐 golden | 通过 |
 | FD/LD 门禁（`enable_dcp` 属性）：非 DCP 长 S2（L=16384）QLD 使能核数 0；DCP 长 S2（L=16384，P=8）为 1；DCP 短 S2（L=8192）为 0 | 通过 |
 | FD/LD 打开后的 DCP：`P=8/S=128/C=131072`（本地 L=16384）index/score 与 golden 一致 | 通过 |
-| 合计 | **19 passed**（15 DCP + 4 offset） |
+| **DCP+LD 可见长度远小于本地 L**：`seqused_k` padding 到 16384，`P=8/S=128`，C=1152（可见 256/128）与 C=128（可见 0），覆盖 rank 0/1/7；验证段整段不可见、零可见行、归约不缺 partial | 通过（4 组，修复 §5.10 的漏写 bug 后） |
+| DCP 互斥：`output_idx_offset` 非空、`cmp_ratio>1` 均被 tiling 拒绝 | 通过 |
+| 合计 | **26 passed**（15 DCP + 4 offset + 4 不可见段 + 1 门禁 + 2 互斥） |
 
 FD/LD 门禁调整后的耗时复核（910B3，NPU1，bulk 50 次取中位，含约 6–9us 启动开销）：
 
