@@ -18,10 +18,10 @@
 
 A2/A3（arch22）与 A5（arch35）的 DCP 实现是两套不同的分工：
 
-- **A2/A3**：metadata 仍按本地完整 L 切分（FD 时 `s2End` 是块游标，不做 DCP 换算），kernel 在块级/行级
-  用闭式公式自行裁剪可见长度；`enable_dcp=1` 仅用于在 A2/A3 上打开 FD/LD（要求 `cmp_ratio=1`）。
-  FD 打开后 metadata 的切分范围可能包含整段不可见块，kernel 对「首个分片 ≤ 可见块数」和
-  「末分片 `s2End==0` 表示本地完整 L」分别处理，避免漏写归约 partial（上游 `f54a82372`）。
+- **A2/A3**：自 2026-10-28 起 metadata 也走同一 DCP 分支（`enable_dcp=1` 时按可见上界切 S2、
+  按可见上界做 FD 阈值），kernel 保留行级 DCP 裁剪；`s2End==0` 的开区间终点取可见上界，
+  仅当分片起点越过可见上界（旧版 metadata）才回退到本地完整 L 的块数。也就是说 A2/A3 与 A5
+  现在共享“metadata 为权威上界”的设计，差别只在 SoC 门禁（A2/A3 要求 `cmp_ratio=1`）。
 - **A5（arch35）**：`supportFd_` 在 `maxVisibleS2 >= topk` 且 `maxVisibleS2 > 5*s2BaseSize_` 时为真
   （`maxVisibleS2` 是 DCP 可见长度的 batch 最大值，见 §6.4；非 DCP 时退化为本地 L），
   metadata 会把行组按块切分给多个核；arch35 kernel 的 `CalcS2LoopParams()` 在核尾行组直接使用
@@ -271,8 +271,8 @@ return {0, (int64_t)visibleForBlock - 1};
 
 - 可见长度对 `u` 单调，batch 内最大值在最后一行（`u = C`），因此
   `maxVisible = max_b CalcDcpVisibleLen(C_b, L_b, P, r, S)`，不需要遍历行组；
-- 仅当 `enable_dcp=1 && attentionMode_ != 0 && SoC=950` 时使用该值；非 DCP、`mask_mode=0`、
-  A2/A3 仍用本地 L（A2/A3 的 metadata 不做 DCP 换算，见 §1）；
+- 仅当 `enable_dcp=1 && attentionMode_ != 0` 时使用该值；非 DCP、`mask_mode=0` 仍用本地 L
+  （A2/A3 与 A5 共用，见 §1）；
 - 判据本身不变：`maxVisible >= topk && maxVisible > 5*s2BaseSize_`；
 - 目的：`seqused_k` padding 很大、实际可见很小时不再白开 FD 和 S2 切分。
 

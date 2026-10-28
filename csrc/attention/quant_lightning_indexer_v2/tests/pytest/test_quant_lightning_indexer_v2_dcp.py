@@ -699,20 +699,21 @@ def test_qliv2_output_idx_offset_padding(local_len, offset):
 
 @pytest.mark.ci
 @pytest.mark.parametrize(
-    "cp_rank,causal_len,expected_valid",
+    "cp_rank,causal_len,expected_valid,visible,expect_fd",
     [
-        (0, 1152, 256),   # 可见 256，本地 16384：第 1..7 段完全不可见
-        (1, 1152, 128),   # 可见 128，同上
-        (7, 1152, 128),   # 可见 128，同上
-        (1, 128, 0),      # 本 rank 可见长度为 0：所有段不可见，输出全 -1/-inf
+        (0, 1152, 256, 256, False),    # 可见 256 < FD 阈值：padding 到 16384 也不开 FD
+        (1, 1152, 128, 128, False),    # 可见 128
+        (7, 1152, 128, 128, False),    # 可见 128
+        (1, 128, 0, 0, False),         # 本 rank 可见长度为 0：输出全 -1/-inf，FD 关闭
+        (0, 98304, 512, 12288, True),  # 可见 12288 > 阈值：FD 开，但切分只到可见上界
     ],
 )
-def test_qliv2_dcp_ld_invisible_segments(cp_rank, causal_len, expected_valid):
-    """LD 打开 + 本地 L 远大于可见前缀：大量 S2 段对每一行都完全不可见。
+def test_qliv2_dcp_ld_invisible_segments(cp_rank, causal_len, expected_valid, visible, expect_fd):
+    """DCP-aware metadata：padding L 大于可见前缀时的 FD 阈值与切分归属。
 
-    pad_l=16384 超过 FD 阈值 5*2048，metadata 会做 S2 跨核切分；可见长度仍由
-    全局 C 决定（256/128/0），因此切分后多数核只处理不可见段，只能写
-    (-inf, -1) 的 partial，最终由归约核合并。
+    metadata 在 A2/A3 与 A5 上都按 DCP 可见长度算 s2End 和 FD 阈值：
+    - 可见 256/128/0 时阈值不满足，FD 关闭，kernel 走自算上界，padding 段不白算；
+    - 可见 12288 时 FD 打开，但切分范围只到可见上界，不会把不可见段分给核。
     """
     _require_npu()
     base = _make_case(8, cp_rank, 128, 1, 1, [causal_len], 512, seed=0)
@@ -721,11 +722,10 @@ def test_qliv2_dcp_ld_invisible_segments(cp_rank, causal_len, expected_valid):
     meta = _build_metadata(case, case["topk"], 3, enable_dcp=True, cp_world=8, cp_rank=cp_rank,
                            cp_interleave=128).cpu().numpy()
     qld = meta[288:288 + 72 * 8].reshape(72, 8)[:, 0]
-    if not _is_a5():
-        # A2/A3: metadata 按本地完整 L 切分，必然分配到不可见段，FD/LD 必须打开。
+    if expect_fd:
         assert (qld == 1).any(), "FD/LD 未打开，用例没有覆盖 LD 归约路径"
-    # A5: metadata 已是 DCP-aware，不可见段被裁剪；可见长度 <= 2 块时不会跨核切分，
-    # LD 合法地关闭（rank0 的 256 可见长度仍会覆盖 FD/LD 路径）。
+    else:
+        assert (qld == 0).all(), "可见长度小于阈值时不应打开 FD"
 
     out, values = _compare_rank(case, 8, cp_rank, 128)
     valid_counts = (out >= 0).sum(axis=1)
@@ -736,7 +736,7 @@ def test_qliv2_dcp_ld_invisible_segments(cp_rank, causal_len, expected_valid):
     else:
         assert (out[:, :expected_valid] >= 0).all()
         assert (out[:, expected_valid:] == -1).all()
-        assert (out[:, :expected_valid] < expected_valid).all(), "选到了可见前缀之外的 token"
+        assert (out[:, :expected_valid] < visible).all(), "选到了可见前缀之外的 token"
 
 
 @pytest.mark.ci

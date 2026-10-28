@@ -212,13 +212,18 @@ uint32 cpInterleaveSize;
 
 ### 4.3 多核切分不变性
 
-arch22 的 metadata 算子（`quant_lightning_indexer_v2_metadata`）只按 `bN2/gS1` 给核分配任务。`supportFd_`（是否做 FD/LD 的 S2 跨核切分）在 A2/A3 上由新增的 `enable_dcp` 属性控制：仅当 `enable_dcp=1` 且 `cmp_ratio=1` 时打开，950 维持原有判断（仅 SoC 相关）。
+arch22 的 metadata 现在与 arch35 共用 DCP 公式（2026-10-28 起，A2/A3 不再走“非 DCP 切分 + kernel 兜底”）：
 
-- **这是唯一的 metadata 接口变化**：`enable_dcp` 只作为 FD/LD 的开关，不参与 `bN2/gS1/s2` 的任何切分计算；metadata 仍按本地完整 `L` 计算 `s2Start/s2End`。
-- 该切分是 DCP 可见范围的**超集**（每个 rank 的本地 `L` 就是分到它的 token 数，DCP 可见长度 ≤ `L`），所以不会漏块；kernel 侧按行内绝对可见前缀在段内裁剪。
-- 核间负载均衡仍使用非 DCP 的 cost 估计，DCP 下可能不最优，但不影响正确性；作为后续性能项（§10）。
+- `enable_dcp=1` 时，`CalcS2TokenRange()` 用 `u = C - s1Size + s1LastToken + 1` 算行组可见上界，
+  `CalcS1GCache()` 据此产出 DCP-aware 的 `s2Start/s2End` 与 cost；A2/A3 与 950 走同一分支
+  （`enable_dcp` 仍是开关，但不再限定 950）。
+- FD 阈值 `supportFd_` 改用每个 batch 的最大可见长度（可见长度对 `u` 单调，取最后一行 `u=C`），
+  不再用 padding 后的本地 `L`；`s2BaseNum` 仍按 `L` 只用于空 batch 判定。
+- kernel 侧保留行级 DCP 裁剪；`s2End==0` 的开区间终点取可见上界 `s2BlockNum`，仅当分片起点
+  越过可见上界（旧版 metadata 或非 DCP 切分）才回退到本地完整 `L` 的块数，保证仍写 partial。
+- `enable_dcp=0` 时 metadata 行为与原来完全一致（`s2End=0`、FD 按原 SoC 规则）。
 
-arch35（950）的 FD/LD 会把 metadata 的 `s2End` 当权威上界；950 的 DCP 支持仍需让 metadata 感知 `C/P/r/S` 并产出 DCP 版切分——本期不做（950 上 DCP 本就未开启）。
+因此 A2/A3 在 padding 场景下也不会再把不可见段切给核；`s2End` 现在是两侧一致的权威上界。
 
 ### 4.4 Workspace
 
@@ -349,17 +354,22 @@ FD/LD 关闭时（950 以外默认、或 `cmp_ratio>1`）保持原逻辑：`isNe
 
 ### 5.10 DCP+LD 的分片归属（本地 L 与可见上界不一致）
 
-metadata 按本地完整 `L`（`seqused_k`）切 S2，而 kernel 的可见上界 `s2BlockNum` 由 DCP 公式给出。两者通常相等；但框架若把 `seqused_k` 传成 padding 后的容量（可见长度远小于 L），旧实现会漏写部分 workspace：
+在 metadata 还不是 DCP-aware 的版本上（`f54a82372` 修复的场景），metadata 按 padding 后的本地 `L` 切 S2，
+而 kernel 的可见上界 `s2BlockNum` 由 DCP 公式给出，两者在“可见 << L”时不一致：
 
 - 第一个分片的 `s2End` 可能 `<= s2BlockNum`，旧实现据此判定“本核独占、无需归约”，不做 LD 写回；
 - 最后一个分片 `s2End==0`（开区间），旧实现用 `s2BlockNum` 当终点，`s2Start >= s2BlockNum` 时循环不执行，同样漏写。
 
-漏写的 partial 在 workspace 里是未初始化数据，归约核会把它当成 `(0,0)` 合并，输出出现重复索引和 0 分。修复在 `CalcS2LoopParams`：
+漏写的 partial 在 workspace 里是未初始化数据，归约核会把它当成 `(0,0)` 合并，输出出现重复索引和 0 分。
+修复分两层：
 
-- `dcpEnable && isEnd && (s2Start>0 || s2End!=0)` 时按 metadata 语义处理：`s2End != 0` 用它，`s2End == 0` 用 `ceil(actS2Size / s2BaseSize)`（本地完整 L 的块数），不再用可见上界；
-- 该分支强制 `isNeedLD = true`，保证每个分片都写 partial。
+1. metadata 在 A2/A3 上改为 DCP-aware（`enable_dcp=1` 时按可见上界切 S2、按可见上界做 FD 阈值），
+   切分范围不再包含不可见段（2026-10-28）；
+2. kernel 的 `CalcS2LoopParams` 保留防御：`dcpEnable && isEnd && (s2Start>0 || s2End!=0)` 时强制
+   `isNeedLD = true`；`s2End==0` 的开区间终点取 `s2BlockNum`，仅当 `s2Start >= s2BlockNum`
+   （旧版 metadata）才回退到本地完整 `L` 的块数，确保每个分片都写 partial。
 
-正常 DCP 形状（可见≈L）行为与修改前一致，实测耗时不变（110.4us @ topk=1024）；padding 场景由新增用例覆盖（§10.2）。
+正常 DCP 形状（可见≈L）的切分结果与修改前一致；padding 场景由 §10.2 的用例覆盖。
 
 ---
 
@@ -484,9 +494,9 @@ metadata 按本地完整 `L`（`seqused_k`）切 S2，而 kernel 的可见上界
 | 非 DCP `return_value=1`：index 集合与 BF16 score 对齐 golden | 通过 |
 | FD/LD 门禁（`enable_dcp` 属性）：非 DCP 长 S2（L=16384）QLD 使能核数 0；DCP 长 S2（L=16384，P=8）为 1；DCP 短 S2（L=8192）为 0 | 通过 |
 | FD/LD 打开后的 DCP：`P=8/S=128/C=131072`（本地 L=16384）index/score 与 golden 一致 | 通过 |
-| **DCP+LD 可见长度远小于本地 L**：`seqused_k` padding 到 16384，`P=8/S=128`，C=1152（可见 256/128）与 C=128（可见 0），覆盖 rank 0/1/7；验证段整段不可见、零可见行、归约不缺 partial | 通过（4 组，修复 §5.10 的漏写 bug 后） |
+| **DCP-aware 的 FD 阈值/切分**：`seqused_k` padding 到 16384，`P=8/S=128`；可见 256/128/0 时 FD 关闭（QLD=0）且输出正确；可见 12288 时 FD 打开、切分只到可见上界，输出 512 个有效索引且全部 < 12288 | 通过（5 组） |
 | DCP 互斥：`output_idx_offset` 非空、`cmp_ratio>1` 均被 tiling 拒绝 | 通过 |
-| 合计 | **26 passed**（15 DCP + 4 offset + 4 不可见段 + 1 门禁 + 2 互斥） |
+| 合计 | **28 passed, 9 skipped**（skipped 为 A5/950 专属用例，910B3 自动跳过） |
 
 FD/LD 门禁调整后的耗时复核（910B3，NPU1，bulk 50 次取中位，含约 6–9us 启动开销）：
 

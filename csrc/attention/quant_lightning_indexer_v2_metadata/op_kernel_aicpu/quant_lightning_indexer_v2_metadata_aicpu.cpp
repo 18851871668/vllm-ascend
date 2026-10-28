@@ -358,10 +358,10 @@ void QuantLightningIndexerV2MetadataCpuKernel::CalcSplitInfo(SplitContext &split
         uint32_t s1Size = GetS1SeqSize(bIdx);
         uint32_t s2Size = GetS2SeqSize(bIdx);
         uint32_t effectiveS2Size = s2Size;
-        if (enableDcp_ != 0 && attentionMode_ != 0 && cpWorld_ > 0 && cpInterleaveSize_ > 0 &&
-            socVersion_.find("Ascend950") != std::string::npos) {
+        if (enableDcp_ != 0 && attentionMode_ != 0 && cpWorld_ > 0 && cpInterleaveSize_ > 0) {
             // DCP: 可见长度对 u 单调, batch 内最大值在最后一行 (u = C)。FD 阈值必须用真实
             // 可见长度, 否则 seqused_k padding 很大、实际可见很小时会白白打开 FD 和 S2 切分。
+            // arch22 (A2/A3) 与 arch35 共用该判据, 两边的 s2End 都已按 DCP 换算。
             uint32_t globalCausalLen = GetGlobalCausalLen(bIdx);
             uint32_t localS2Len = static_cast<uint32_t>(GetRevertS2Size(bIdx));
             effectiveS2Size = QLIV2Dcp::CalcDcpVisibleLen(globalCausalLen, localS2Len,
@@ -476,7 +476,9 @@ Range<int64_t> QuantLightningIndexerV2MetadataCpuKernel::CalcS2TokenRange(uint32
         }
     }
 
-    if (enableDcp_ != 0 && socVersion_.find("Ascend950") != std::string::npos) {
+    // A2/A3 与 A5 共用 DCP-aware 的 S2 上界: metadata 和 kernel 必须用同一闭式,
+    // 否则 FD 切分范围会超出真实可见前缀 (padding 场景白算, 或分片越界漏写 partial)。
+    if (enableDcp_ != 0) {
         // A5 DCP-aware: 行组最后一行的全局 exclusive 上界, 与 arch35 kernel 的块级公式保持一致。
         int64_t uSigned = static_cast<int64_t>(batchCache.causalGlobalLen) - static_cast<int64_t>(batchCache.s1Size) +
                           s1LastToken + 1;
