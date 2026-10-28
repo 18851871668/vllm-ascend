@@ -24,12 +24,13 @@
 using namespace QLIV2Kernel;
 using namespace optiling::detail;
 
-#define INVOKE_LI_NO_KFC_OP_IMPL(templateClass, ...) \
-    do { \
-        templateClass<QLIV2Type<__VA_ARGS__>> op; \
+#define INVOKE_LI_NO_KFC_OP_IMPL(templateClass, ...)                                                                 \
+    do {                                                                                                             \
+        templateClass<QLIV2Type<__VA_ARGS__>> op;                                                                    \
         op.Init(query, key, weights, queryScale, keyScale, cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, \
-                blockTable, outputIdxOffset, metadata, sparseIndices, sparseValues, user, tiling_data, &tPipe); \
-        op.Process(); \
+                blockTable, outputIdxOffset, metadata, causalSeqlensKvGlobal, sparseIndices, sparseValues, user,     \
+                tiling_data, &tPipe);                                                                                \
+        op.Process();                                                                                                \
     } while (0)
 
 // arch22: 含 candidate_topk_index 输入/输出 (两级TopK)

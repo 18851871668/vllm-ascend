@@ -433,7 +433,8 @@ aclnnStatus aclnnQuantLightningIndexerV2(
       <td>
           <ul>
                 <li>true 时按 C/P/r/S 计算每行本地可见 KV 长度；false 时保持原有计算行为。</li>
-                <li>当前仅 arch22（Atlas A3、Atlas A2）支持。</li>
+                <li>arch22（Atlas A2/A3）与 arch35（Ascend950/A5）支持。</li>
+                <li>A5 上 metadata 算子必须同步传入相同的 DCP 参数与 causal_seqlens_kv_global，metadata 与 kernel 使用同一套可见长度公式。</li>
           </ul>
       </td>
       <td>BOOL</td>

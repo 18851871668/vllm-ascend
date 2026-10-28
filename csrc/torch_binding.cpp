@@ -1438,9 +1438,10 @@ at::Tensor npu_quant_lightning_indexer_v2_metadata_npu(
     int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim, int64_t topk, int64_t quant_mode,
     const c10::optional<at::Tensor> &cu_seqlens_q, const c10::optional<at::Tensor> &cu_seqlens_k,
     const c10::optional<at::Tensor> &seqused_q, const c10::optional<at::Tensor> &seqused_k,
-    const c10::optional<at::Tensor> &cmp_residual_k, int64_t batch_size, int64_t max_seqlen_q, int64_t max_seqlen_k,
-    const c10::string_view layout_q, c10::string_view layout_k, int64_t mask_mode, int64_t cmp_ratio,
-    int64_t enable_dcp, const c10::string_view device)
+    const c10::optional<at::Tensor> &cmp_residual_k, const c10::optional<at::Tensor> &causal_seqlens_kv_global,
+    int64_t batch_size, int64_t max_seqlen_q, int64_t max_seqlen_k, const c10::string_view layout_q,
+    c10::string_view layout_k, int64_t mask_mode, int64_t cmp_ratio, int64_t enable_dcp, int64_t cp_world,
+    int64_t cp_rank, int64_t cp_kv_cache_interleave_size, const c10::string_view device)
 {
     constexpr int64_t OUTPUT_SIZE = 1024;
     at::Device output_device = at::Device(std::string(device));
@@ -1454,6 +1455,8 @@ at::Tensor npu_quant_lightning_indexer_v2_metadata_npu(
         output_device = seqused_q.value().device();
     } else if (cmp_residual_k.has_value()) {
         output_device = cmp_residual_k.value().device();
+    } else if (causal_seqlens_kv_global.has_value()) {
+        output_device = causal_seqlens_kv_global.value().device();
     }
 
     at::Tensor output = torch::empty({OUTPUT_SIZE}, torch::dtype(torch::kInt32).device(output_device));
@@ -1462,6 +1465,7 @@ at::Tensor npu_quant_lightning_indexer_v2_metadata_npu(
     auto seqused_q_val = get_valid_tensor(seqused_q, output_device);
     auto seqused_k_val = get_valid_tensor(seqused_k, output_device);
     auto cmp_residual_k_val = get_valid_tensor(cmp_residual_k, output_device);
+    auto causal_seqlens_kv_global_val = get_valid_tensor(causal_seqlens_kv_global, output_device);
 
     std::string layout_q_str = std::string(layout_q);
     char *layout_q_ptr = const_cast<char *>(layout_q_str.c_str());
@@ -1469,9 +1473,10 @@ at::Tensor npu_quant_lightning_indexer_v2_metadata_npu(
     char *layout_k_ptr = const_cast<char *>(layout_k_str.c_str());
 
     EXEC_NPU_CMD(aclnnVllmAscendQuantLightningIndexerV2Metadata,
-                 cu_seqlens_q_val, cu_seqlens_k_val, seqused_q_val, seqused_k_val,
-                 cmp_residual_k_val, num_heads_q, num_heads_k, head_dim, topk, quant_mode, batch_size, max_seqlen_q,
-                 max_seqlen_k, layout_q_ptr, layout_k_ptr, mask_mode, cmp_ratio, enable_dcp, output);
+                 cu_seqlens_q_val, cu_seqlens_k_val, seqused_q_val, seqused_k_val, cmp_residual_k_val,
+                 causal_seqlens_kv_global_val, num_heads_q, num_heads_k, head_dim, topk, quant_mode, batch_size,
+                 max_seqlen_q, max_seqlen_k, layout_q_ptr, layout_k_ptr, mask_mode, cmp_ratio, enable_dcp, cp_world,
+                 cp_rank, cp_kv_cache_interleave_size, output);
 
     return output;
 }
@@ -3072,9 +3077,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "npu_quant_lightning_indexer_v2_metadata(int num_heads_q, int num_heads_k, int head_dim, int topk, "
         "int quant_mode, *, Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_k=None, Tensor? seqused_q=None, "
-        "Tensor? seqused_k=None, Tensor? cmp_residual_k=None, int batch_size=0, int max_seqlen_q=0, "
-        "int max_seqlen_k=0, str layout_q='TND', str layout_k='PA_BBND', int mask_mode=3, int cmp_ratio=1, "
-        "int enable_dcp=0, str device='npu') -> Tensor"
+        "Tensor? seqused_k=None, Tensor? cmp_residual_k=None, Tensor? causal_seqlens_kv_global=None, "
+        "int batch_size=0, int max_seqlen_q=0, int max_seqlen_k=0, str layout_q='TND', str layout_k='PA_BBND', "
+        "int mask_mode=3, int cmp_ratio=1, int enable_dcp=0, int cp_world=1, int cp_rank=0, "
+        "int cp_kv_cache_interleave_size=1, str device='npu') -> Tensor"
     );
     ops.impl("npu_quant_lightning_indexer_v2_metadata", torch::kPrivateUse1,
              &vllm_ascend::npu_quant_lightning_indexer_v2_metadata_npu);

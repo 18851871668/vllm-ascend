@@ -25,10 +25,12 @@ at::Tensor QuantLightningIndexerMetadata(int64_t numHeadsQ, int64_t numHeadsK, i
                                          const c10::optional<at::Tensor> &cuSeqlensK,
                                          const c10::optional<at::Tensor> &sequsedQ,
                                          const c10::optional<at::Tensor> &sequsedK,
-                                         const c10::optional<at::Tensor> &cmpResidualK, int64_t batchSize,
+                                         const c10::optional<at::Tensor> &cmpResidualK,
+                                         const c10::optional<at::Tensor> &causalSeqlensKvGlobal, int64_t batchSize,
                                          int64_t maxSeqlenQ, int64_t maxSeqlenK, c10::string_view layoutQ,
                                          c10::string_view layoutK, int64_t maskMode, int64_t cmpRatio,
-                                         int64_t enableDcp = 0)
+                                         int64_t enableDcp = 0, int64_t cpWorld = 1, int64_t cpRank = 0,
+                                         int64_t cpInterleaveSize = 1)
 {
     at::Device outputDevice = at::Device(std::string("npu"));
     if (cuSeqlensQ.has_value()) {
@@ -41,6 +43,8 @@ at::Tensor QuantLightningIndexerMetadata(int64_t numHeadsQ, int64_t numHeadsK, i
         outputDevice = sequsedK.value().device();
     } else if (cmpResidualK.has_value()) {
         outputDevice = cmpResidualK.value().device();
+    } else if (causalSeqlensKvGlobal.has_value()) {
+        outputDevice = causalSeqlensKvGlobal.value().device();
     }
 
     at::Tensor output = torch::empty({QLI_V2_METADATA_SIZE}, torch::dtype(torch::kInt32).device(outputDevice));
@@ -49,6 +53,7 @@ at::Tensor QuantLightningIndexerMetadata(int64_t numHeadsQ, int64_t numHeadsK, i
     auto sequsedQVal = valid_tensor(sequsedQ, outputDevice);
     auto sequsedKVal = valid_tensor(sequsedK, outputDevice);
     auto cmpResidualKVal = valid_tensor(cmpResidualK, outputDevice);
+    auto causalSeqlensKvGlobalVal = valid_tensor(causalSeqlensKvGlobal, outputDevice);
 
     std::string layoutQStr = std::string(layoutQ);
     std::string layoutKStr = std::string(layoutK);
@@ -57,8 +62,9 @@ at::Tensor QuantLightningIndexerMetadata(int64_t numHeadsQ, int64_t numHeadsK, i
 
     if (output.device().is_meta()) return output;
     EXEC_NPU_CMD(aclnnVllmAscendQuantLightningIndexerV2Metadata, cuSeqlensQVal, cuSeqlensKVal, sequsedQVal, sequsedKVal,
-              cmpResidualKVal, numHeadsQ, numHeadsK, headDim, topk, quantMode, batchSize, maxSeqlenQ, maxSeqlenK,
-              layoutQPtr, layoutKPtr, maskMode, cmpRatio, enableDcp, output);
+              cmpResidualKVal, causalSeqlensKvGlobalVal, numHeadsQ, numHeadsK, headDim, topk, quantMode, batchSize,
+              maxSeqlenQ, maxSeqlenK, layoutQPtr, layoutKPtr, maskMode, cmpRatio, enableDcp, cpWorld, cpRank,
+              cpInterleaveSize, output);
     return output;
 }
 

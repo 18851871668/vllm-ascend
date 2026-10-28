@@ -22,6 +22,7 @@
 """
 
 import itertools
+import math
 import os
 import sys
 
@@ -107,7 +108,8 @@ def dcp_visible_len(global_end, q_len, row_idx, local_len, cp_world, cp_rank, cp
     return min(local_len, full_rounds + tail)
 
 
-def _build_metadata(case, topk, mask_mode=3, enable_dcp=False, cmp_ratio=1):
+def _build_metadata(case, topk, mask_mode=3, enable_dcp=False, cmp_ratio=1, cp_world=1, cp_rank=0,
+                    cp_interleave=1):
     ops = _qli_ops()
     return getattr(ops, _meta_op_name())(
         num_heads_q=N1,
@@ -117,6 +119,7 @@ def _build_metadata(case, topk, mask_mode=3, enable_dcp=False, cmp_ratio=1):
         quant_mode=2,
         cu_seqlens_q=case["cu_seqlens_q"].npu(),
         seqused_k=case["seqused_k"].npu(),
+        causal_seqlens_kv_global=case["causal_lens"].npu() if enable_dcp else None,
         batch_size=case["batch_size"],
         max_seqlen_q=case["q_len"],
         max_seqlen_k=case["max_l"],
@@ -124,8 +127,12 @@ def _build_metadata(case, topk, mask_mode=3, enable_dcp=False, cmp_ratio=1):
         layout_k="PA_BBND",
         mask_mode=mask_mode,
         cmp_ratio=cmp_ratio,
-        # FD/LD 在 A2/A3 上只对 DCP 场景打开, metadata 需要知道当前是否 DCP。
+        # FD/LD 在 A2/A3 上只对 DCP 场景打开, metadata 需要知道当前是否 DCP;
+        # A5 的 metadata 还需要 C/P/r/S 才能算出 DCP-aware 的 S2 上界。
         enable_dcp=int(bool(enable_dcp)),
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        cp_kv_cache_interleave_size=cp_interleave,
     )
 
 
@@ -254,11 +261,33 @@ def _pad_case(case, pad_l, seed=0):
     return padded
 
 
+def _use_contiguous_block_table(case):
+    """把 PA 的 block_table 改成连续物理块, 触发 arch35 KeyNd2NzForPA 相邻块合并."""
+    batch_size = case["batch_size"]
+    blocks_per_batch = case["block_table"].shape[1]
+    block_num = case["key_pool"].shape[0]
+    block_table = np.arange(block_num, dtype=np.int32).reshape(batch_size, blocks_per_batch)
+    key_pool = torch.zeros_like(case["key_pool"])
+    k_scale_pool = torch.ones_like(case["k_scale_pool"])
+    for b in range(batch_size):
+        for blk in range(blocks_per_batch):
+            start = blk * BLOCK_SIZE
+            end = min(start + BLOCK_SIZE, case["local_lens"][b])
+            if end <= start:
+                continue
+            phys = int(block_table[b, blk])
+            key_pool[phys, : end - start, 0] = case["local_k"][b, 0, start:end]
+            k_scale_pool[phys, : end - start, 0] = case["k_scale_logical"][b, 0, start:end]
+    case["block_table"] = torch.from_numpy(block_table)
+    case["key_pool"] = key_pool
+    case["k_scale_pool"] = k_scale_pool
+
+
 def _run_op(case, cp_world=1, cp_rank=0, cp_interleave=1, mask_mode=3, enable_dcp=True, return_value=1,
             idx_offset=None, cmp_ratio=1):
     ops = _qli_ops()
-    metadata = _build_metadata(case, case["topk"], mask_mode, enable_dcp=enable_dcp,
-                               cmp_ratio=cmp_ratio).npu()
+    metadata = _build_metadata(case, case["topk"], mask_mode, enable_dcp=enable_dcp, cmp_ratio=cmp_ratio,
+                               cp_world=cp_world, cp_rank=cp_rank, cp_interleave=cp_interleave).npu()
     return getattr(ops, _indexer_op_name())(
         case["query"].npu(),
         case["key_pool"].npu(),
@@ -342,6 +371,23 @@ def _run_golden(case, cp_world=1, cp_rank=0, cp_interleave=1, sparse_mode=3, dcp
     return y.numpy(), values.numpy()
 
 
+def _to_bf16(value):
+    """按 round-to-nearest-even 把 FP32 分数转成 BF16, 用于边界并列判定."""
+    arr = np.array([value], dtype=np.float32)
+    u = arr.view(np.uint32)
+    lsb = (u >> 16) & 1
+    u = (u + np.uint32(0x7FFF) + lsb) & np.uint32(0xFFFF0000)
+    return u.view(np.float32)[0].item()
+
+
+def _bf16_ulp(value):
+    """BF16 在该数量级下的一个 ULP (7 位尾数)."""
+    v = abs(float(value))
+    if v == 0.0:
+        return 2.0**-133
+    return 2.0 ** (math.floor(math.log2(v)) - 7)
+
+
 def _row_scores(case, cp_world, cp_rank, cp_interleave):
     """按算子数学定义逐行重建 golden 分数 (用于并列/边界仲裁), 返回 [T1, max_l]."""
     q = case["query"].to(torch.int32).numpy()
@@ -391,7 +437,15 @@ def _compare_rank(case, cp_world, cp_rank, cp_interleave):
             boundary = min(scores[row, list(ref_set)]) if only_ref else None
             for i in only_pred:
                 for j in only_ref:
-                    assert abs(scores[row, i] - scores[row, j]) <= 1e-3 * max(1.0, abs(scores[row, j])), (
+                    # 算子内部按 BF16 sortable score 排序; 量化后同分、或分差在 1 个 BF16 ULP
+                    # 以内, 都视为并列成员, 允许跨 rank/分核顺序不同 (设计文档 R1/R8)。
+                    same_bf16 = _to_bf16(scores[row, i]) == _to_bf16(scores[row, j])
+                    within_bf16_ulp = abs(scores[row, i] - scores[row, j]) <= _bf16_ulp(scores[row, j])
+                    assert (
+                        same_bf16
+                        or within_bf16_ulp
+                        or abs(scores[row, i] - scores[row, j]) <= 1e-3 * max(1.0, abs(scores[row, j]))
+                    ), (
                         f"row {row}: index set mismatch pred-only={i} ref-only={j} "
                         f"score_pred={scores[row, i]} score_ref={scores[row, j]} boundary={boundary}"
                     )
@@ -471,6 +525,94 @@ def test_qliv2_dcp(cp_world, cp_interleave, batch_size, q_len, causal_lens, topk
             assert abs(score - boundary) <= tie_step, (
                 f"row {row}: non-tie diff global={g} score={score} boundary={boundary}"
             )
+
+
+def _is_a5():
+    if torch_npu is None or not hasattr(torch, "npu") or not torch.npu.is_available():
+        return False
+    try:
+        return torch_npu.npu.get_soc_version() == 260
+    except Exception:  # pragma: no cover - older torch_npu
+        return False
+
+
+@pytest.mark.ci
+@pytest.mark.skipif(not _is_a5(), reason="A5 (Ascend950) only: topk 8192 and A5 kernel path")
+def test_qliv2_dcp_a5_topk8192():
+    """A5 专属: DCP + topk=8192 的单 rank golden 校验."""
+    _require_npu()
+    case = _make_case(2, 0, 128, 1, 4, [8193], 8192, seed=0)
+    idx, _ = _compare_rank(case, 2, 0, 128)
+    assert idx.shape[-1] == 8192
+
+
+LARGE_CASES = [
+    # (P, S, B, Q_len, C per batch, topk)
+    (2, 256, 1, 2, [32769], 8192),  # 大 C / 大 topk, 本地 L=16385, FD 开启
+    (4, 512, 1, 4, [16385], 4096),  # 大 S, 本地 L=4097, FD 开启
+    (2, 128, 4, 4, [4097] * 4, 2048),  # 多 batch 大 shape, FD 开启
+    (4, 128, 1, 16, [16385], 4096),  # 较长 Q_len, 本地 L=4097, FD 开启
+]
+
+
+@pytest.mark.ci
+@pytest.mark.skipif(not _is_a5(), reason="A5 large-shape DCP")
+@pytest.mark.parametrize("cp_world,cp_interleave,batch_size,q_len,causal_lens,topk", LARGE_CASES)
+def test_qliv2_dcp_large_shape(cp_world, cp_interleave, batch_size, q_len, causal_lens, topk):
+    """A5 大 shape 泛化: 大 C/S、多 batch、长 Q_len, 只校验 return_value=1."""
+    _require_npu()
+    rank_outputs = []
+    for rank in range(cp_world):
+        case = _make_case(cp_world, rank, cp_interleave, batch_size, q_len, causal_lens, topk, seed=0)
+        idx, val = _compare_rank(case, cp_world, rank, cp_interleave)
+        rank_outputs.append((idx, val))
+
+    merged_rows = _merge_global_per_row(rank_outputs, cp_world, cp_interleave, topk)
+    ref_case = _make_case(1, 0, 1, batch_size, q_len, causal_lens, topk, seed=0)
+    ref_out, _ = _run_op(ref_case, 1, 0, 1)
+    ref_out = ref_out.cpu().numpy()[:, 0, :]
+    for row, merged in enumerate(merged_rows):
+        ref = set(ref_out[row][ref_out[row] >= 0].tolist())
+        assert set(merged) == ref, f"row {row}: merged global topk != P=1 topk, diffs={sorted(set(merged) ^ ref)}"
+
+
+HIGH_P_CASES = [
+    # (P, S, B, Q_len, C per batch, topk)
+    (8, 1, 1, 2, [4097], 512),  # P=8, 逐 token 轮转, 本地 L≈512, FD 关闭
+    (8, 128, 1, 4, [8193], 1024),  # P=8, 大 interleave, 本地 L≈1025, FD 开启
+    (16, 64, 1, 1, [8193], 512),  # P=16, 本地 L≈513, FD 关闭
+    (16, 128, 1, 1, [16385], 1024),  # P=16, 本地 L≈1025, FD 开启
+]
+
+
+@pytest.mark.ci
+@pytest.mark.skipif(not _is_a5(), reason="A5 high-P DCP")
+@pytest.mark.parametrize("cp_world,cp_interleave,batch_size,q_len,causal_lens,topk", HIGH_P_CASES)
+def test_qliv2_dcp_high_p(cp_world, cp_interleave, batch_size, q_len, causal_lens, topk):
+    """A5 高 CP 组泛化: P=8/16, 覆盖 S=1/64/128 与 FD 开/关, 只校验 return_value=1."""
+    _require_npu()
+    rank_outputs = []
+    for rank in range(cp_world):
+        case = _make_case(cp_world, rank, cp_interleave, batch_size, q_len, causal_lens, topk, seed=0)
+        idx, val = _compare_rank(case, cp_world, rank, cp_interleave)
+        rank_outputs.append((idx, val))
+
+    merged_rows = _merge_global_per_row(rank_outputs, cp_world, cp_interleave, topk)
+    ref_case = _make_case(1, 0, 1, batch_size, q_len, causal_lens, topk, seed=0)
+    ref_out, _ = _run_op(ref_case, 1, 0, 1)
+    ref_out = ref_out.cpu().numpy()[:, 0, :]
+    for row, merged in enumerate(merged_rows):
+        ref = set(ref_out[row][ref_out[row] >= 0].tolist())
+        assert set(merged) == ref, f"row {row}: merged global topk != P=1 topk, diffs={sorted(set(merged) ^ ref)}"
+
+
+@pytest.mark.ci
+def test_qliv2_contiguous_pa_block_table():
+    """连续物理 block_table: 覆盖 arch35 KeyNd2NzForPA 相邻物理块合并路径."""
+    _require_npu()
+    case = _make_case(2, 0, 128, 1, 2, [4097], 1024, seed=0)
+    _use_contiguous_block_table(case)
+    _compare_rank(case, 2, 0, 128)
 
 
 @pytest.mark.ci
@@ -576,9 +718,14 @@ def test_qliv2_dcp_ld_invisible_segments(cp_rank, causal_len, expected_valid):
     base = _make_case(8, cp_rank, 128, 1, 1, [causal_len], 512, seed=0)
     case = _pad_case(base, 16384)
 
-    meta = _build_metadata(case, case["topk"], 3, enable_dcp=True).cpu().numpy()
+    meta = _build_metadata(case, case["topk"], 3, enable_dcp=True, cp_world=8, cp_rank=cp_rank,
+                           cp_interleave=128).cpu().numpy()
     qld = meta[288:288 + 72 * 8].reshape(72, 8)[:, 0]
-    assert (qld == 1).any(), "FD/LD 未打开，用例没有覆盖 LD 归约路径"
+    if not _is_a5():
+        # A2/A3: metadata 按本地完整 L 切分，必然分配到不可见段，FD/LD 必须打开。
+        assert (qld == 1).any(), "FD/LD 未打开，用例没有覆盖 LD 归约路径"
+    # A5: metadata 已是 DCP-aware，不可见段被裁剪；可见长度 <= 2 块时不会跨核切分，
+    # LD 合法地关闭（rank0 的 256 可见长度仍会覆盖 FD/LD 路径）。
 
     out, values = _compare_rank(case, 8, cp_rank, 128)
     valid_counts = (out >= 0).sum(axis=1)
@@ -594,14 +741,20 @@ def test_qliv2_dcp_ld_invisible_segments(cp_rank, causal_len, expected_valid):
 
 @pytest.mark.ci
 def test_qliv2_ld_gate_non_dcp_vs_dcp():
-    """门禁回归：非 DCP 长 S2 不开 LD；DCP 长 S2 开 LD。"""
+    """门禁回归：A2/A3 非 DCP 长 S2 不开 LD；A5 维持原有行为；DCP 长 S2 开 LD。"""
     _require_npu()
     non_dcp = _make_case(1, 0, 1, 1, 1, [16384], 512, seed=0)
     m0 = _build_metadata(non_dcp, 512, 3, enable_dcp=False).cpu().numpy()
-    assert ((m0[288:288 + 72 * 8].reshape(72, 8)[:, 0]) == 0).all(), "非 DCP 不应打开 LD"
+    m0_qld = m0[288:288 + 72 * 8].reshape(72, 8)[:, 0]
+    if _is_a5():
+        # A5 (arch35) 的 FD/LD 不区分 DCP 场景, 长 S2 维持原有行为。
+        assert (m0_qld == 1).any(), "A5 非 DCP 长 S2 应维持原有 FD/LD 行为"
+    else:
+        assert (m0_qld == 0).all(), "A2/A3 非 DCP 不应打开 LD"
 
     dcp = _make_case(8, 0, 128, 1, 1, [131072], 512, seed=0)  # 本地 L=16384
-    m1 = _build_metadata(dcp, 512, 3, enable_dcp=True).cpu().numpy()
+    m1 = _build_metadata(dcp, 512, 3, enable_dcp=True, cp_world=8, cp_rank=0,
+                         cp_interleave=128).cpu().numpy()
     assert (m1[288:288 + 72 * 8].reshape(72, 8)[:, 0] == 1).any(), "DCP 长 S2 应打开 LD"
 
 

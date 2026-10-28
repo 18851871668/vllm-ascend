@@ -14,6 +14,7 @@
  */
 #ifndef QUANT_LIGHTNING_INDEXER_V2_COMMON_H
 #define QUANT_LIGHTNING_INDEXER_V2_COMMON_H
+#include "../quant_lightning_indexer_v2_dcp_common.h"
 using namespace AscendC;
 namespace QLIV2Common {
 using FP8E4M3 = fp8_e4m3fn_t;
@@ -80,6 +81,7 @@ struct RunInfo {
     uint32_t actS1Size = 1;
     uint32_t actS2Size = 1;
     uint32_t actS2SizeOrig = 1;
+    uint32_t causalGlobalLen = 0;  // DCP: 当前 bIdx 的全局 exclusive 上界 C
     uint32_t actMBaseSize;
     uint32_t actualSingleProcessSInnerSize;
     uint32_t actualSingleProcessSInnerSizeAlign;
@@ -164,6 +166,12 @@ struct ConstInfo {
     bool isAccumSeqS2 = false;        // 是否累加模式
     bool isLDOpen = false;
     bool returnValue = false;
+
+    // DCP (Decode Context Parallel, 解码上下文并行)
+    bool dcpEnable = false;
+    uint32_t cpWorld = 1U;           // P: CP 组大小
+    uint32_t cpRank = 0U;            // r: 当前 rank
+    uint32_t cpInterleaveSize = 1U;  // S: 每 S 个 token 轮换 rank
 };
 
 struct LdSplitCoreInfo {

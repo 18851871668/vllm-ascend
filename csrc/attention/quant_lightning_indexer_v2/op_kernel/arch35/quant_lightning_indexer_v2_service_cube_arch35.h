@@ -248,8 +248,12 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::ComputeMm1(const QLIV2Common::RunInf
                 }
             }
 
-            SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-            WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+            // P6: 首次 S2 块的 query 分支会在本迭代稍后发同一个 MTE2_MTE1 握手，
+            // set_flag 排在此前所有 MTE2 之后，因此这一对可省；其余迭代保留。
+            if (!(runInfo.isFirstS2InnerLoop && s2GmOffset == 0)) {
+                SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+                WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+            }
             // s1gProcessSize当前必定不会超过2倍的s1g basic block
             for (uint64_t s1gGmOffset = 0; s1gGmOffset < s1gProcessSize; s1gGmOffset += constInfo_.mBaseSizeMax) {
                 uint64_t s1gL1RealSize = s1gGmOffset + constInfo_.mBaseSizeMax > s1gProcessSize ?
@@ -330,8 +334,11 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::ComputeMm1(const QLIV2Common::RunInf
                     }
                 }
 
-                SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-                WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+                // P6: 首次 S2 块的 query 分支稍后会发同一个握手，这一对可省。
+                if (!(runInfo.isFirstS2InnerLoop && s2GmOffset == 0)) {
+                    SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+                    WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+                }
 
                 isKeyCacheValid_ = true;
                 keyGmStart_ = s2GmBaseOffset;
@@ -433,13 +440,30 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::KeyNd2NzForPA(uint64_t s2L1RealSize,
     while (s2L1Offset < s2L1RealSize) {
         uint64_t s2BlkId = (s2L1Offset + s2GmOffset) / constInfo_.kCacheBlockSize;
         uint64_t s2BlkOffset = (s2L1Offset + s2GmOffset) % constInfo_.kCacheBlockSize;
-        uint64_t keyGmOffset =
-            blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch + s2BlkId) * constInfo_.keyStride0 +
-            s2BlkOffset * qkHeadDim_;
+        uint64_t curPhyBlk =
+            static_cast<uint64_t>(blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch + s2BlkId));
+        uint64_t keyGmOffset = curPhyBlk * constInfo_.keyStride0 + s2BlkOffset * qkHeadDim_;
 
         uint64_t s2Mte2Size = s2L1RealSize - s2L1Offset;
         s2Mte2Size = s2BlkOffset + s2Mte2Size >= constInfo_.kCacheBlockSize ? constInfo_.kCacheBlockSize - s2BlkOffset :
                                                                               s2Mte2Size;
+        // 相邻逻辑 block 映射到连续物理 block 时合并为一次 Nd2Nz（最多到 s2L1RealSize），
+        // 降低 MTE2 小粒度搬运指令数；仅当 key 0 轴紧凑、物理块在 GM 中连续时启用。
+        const bool keyBlocksContiguous =
+            (constInfo_.keyStride0 == constInfo_.kCacheBlockSize * qkHeadDim_);
+        if (keyBlocksContiguous) {
+            while (s2BlkOffset + s2Mte2Size == constInfo_.kCacheBlockSize &&
+                   s2L1Offset + s2Mte2Size < s2L1RealSize) {
+                uint64_t nextBlkNum = (s2BlkOffset + s2Mte2Size) / constInfo_.kCacheBlockSize;
+                uint64_t nextPhyBlk = static_cast<uint64_t>(
+                    blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch + s2BlkId + nextBlkNum));
+                if (nextPhyBlk != curPhyBlk + nextBlkNum) {
+                    break;
+                }
+                uint64_t s2RemainSize = s2L1RealSize - (s2L1Offset + s2Mte2Size);
+                s2Mte2Size += (s2RemainSize < constInfo_.kCacheBlockSize) ? s2RemainSize : constInfo_.kCacheBlockSize;
+            }
+        }
         Nd2NzParams nd2nzPara;
         nd2nzPara.ndNum = 1;
         nd2nzPara.nValue = s2Mte2Size; // 行数

@@ -87,7 +87,7 @@ visible  = (local_k < L) and (global_k <= global_q)
 
 其中 `C = causal_seqlens_kv_global[b]`，`L = seqused_k[b]`（本地有效长度），`P/cp_world`、`r/cp_rank`、`S/cp_kv_cache_interleave_size`。
 
-DCP 约束（arch22 / Atlas A3、A2）：
+DCP 约束（arch22：Atlas A2/A3；arch35：Ascend950/A5）：
 - `layout_q` 必须为 TND，`layout_k` 必须为 PA_BBND；
 - `cmp_ratio` 必须为 1（CP 不与 KV 压缩叠加）；
 - `candidate_mode` 必须为 3（DCP 与两级 candidate 互斥）；
@@ -95,7 +95,12 @@ DCP 约束（arch22 / Atlas A3、A2）：
 - 不能传 `output_idx_offset`；
 - 输出 index 为**本地逻辑 KV 序号**，由框架按 `global = (local // S * P + r) * S + local % S` 转全局后合并 TopK。
 
-设计细节见 [docs/qli_v2_dcp_design.md](docs/qli_v2_dcp_design.md)。
+A5（arch35）额外要求：`VllmAscendQuantLightningIndexerV2Metadata` 必须同步传入 `causal_seqlens_kv_global` 与
+`enable_dcp/cp_world/cp_rank/cp_kv_cache_interleave_size`。A5 的 FD/LD 会把 metadata 输出的 `s2End` 当作权威块上界，
+metadata 与 kernel 使用同一套 DCP 可见长度公式，否则会漏算。
+
+设计细节见 [docs/qli_v2_dcp_design.md](docs/qli_v2_dcp_design.md)（arch22）与
+[docs/qli_v2_dcp_a5_design.md](docs/qli_v2_dcp_a5_design.md)（arch35）。
 
 ## 调用示例
 

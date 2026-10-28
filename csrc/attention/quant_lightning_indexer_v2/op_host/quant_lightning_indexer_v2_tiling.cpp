@@ -491,15 +491,18 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
     }
 
     // -------------------DCP (Decode Context Parallel, 解码上下文并行) 校验-------------------
-    // 关闭时做反向严格校验, 保证既有调用零变化; 开启时只开放 arch22 的 TND + PA 路径。
+    // 关闭时做反向严格校验, 保证既有调用零变化; 开启时开放 arch22/arch35 的 TND + PA 路径。
     bool enableDcp = (opParamInfo_.enableDcp != nullptr) ? *opParamInfo_.enableDcp : false;
     int32_t cpWorld = (opParamInfo_.cpWorld != nullptr) ? *opParamInfo_.cpWorld : 1;
     int32_t cpRank = (opParamInfo_.cpRank != nullptr) ? *opParamInfo_.cpRank : 0;
     int32_t cpInterleaveSize =
         (opParamInfo_.cpInterleaveSize != nullptr) ? *opParamInfo_.cpInterleaveSize : 1;
     if (enableDcp) {
-        OP_CHECK_IF(npuArch_ != NpuArch::DAV_2201,
-                    OP_LOGE(opName_, "enable_dcp is only supported on ascend910b/ascend910_93 currently."),
+        OP_CHECK_IF((npuArch_ != NpuArch::DAV_2201) && (npuArch_ != NpuArch::DAV_3510),
+                    OP_LOGE(opName_,
+                            "enable_dcp is only supported on ascend910b/ascend910_93/ascend950, but got "
+                            "NpuArch[%d].",
+                            static_cast<int32_t>(npuArch_)),
                     return ge::GRAPH_FAILED);
         OP_CHECK_IF(std::string(opParamInfo_.layOutQuery) != "TND",
                     OP_LOGE(opName_, "enable_dcp requires layout_q=TND, but got %s.",
@@ -512,18 +515,17 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
         OP_CHECK_IF(*opParamInfo_.cmpRatio != 1,
                     OP_LOGE(opName_, "enable_dcp requires cmp_ratio=1, but got %ld.", *opParamInfo_.cmpRatio),
                     return ge::GRAPH_FAILED);
-        OP_CHECK_IF(candidateMode != CANDIDATE_MODE_OFF,
-                    OP_LOGE(opName_, "enable_dcp is mutually exclusive with candidate_mode, but got %u.",
-                            candidateMode),
-                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(
+            candidateMode != CANDIDATE_MODE_OFF,
+            OP_LOGE(opName_, "enable_dcp is mutually exclusive with candidate_mode, but got %u.", candidateMode),
+            return ge::GRAPH_FAILED);
         OP_CHECK_IF(*opParamInfo_.returnValue != 1,
                     OP_LOGE(opName_, "enable_dcp requires return_value=1 (cross-rank global TopK needs scores)."),
                     return ge::GRAPH_FAILED);
         OP_CHECK_IF(opParamInfo_.causalSeqLensKvGlobal.tensor == nullptr,
                     OP_LOGE(opName_, "causal_seqlens_kv_global is required when enable_dcp=true."),
                     return ge::GRAPH_FAILED);
-        OP_CHECK_IF(cpWorld < 1,
-                    OP_LOGE(opName_, "cp_world must >= 1, but got %d.", cpWorld), return ge::GRAPH_FAILED);
+        OP_CHECK_IF(cpWorld < 1, OP_LOGE(opName_, "cp_world must >= 1, but got %d.", cpWorld), return ge::GRAPH_FAILED);
         OP_CHECK_IF((cpRank < 0) || (cpRank >= cpWorld),
                     OP_LOGE(opName_, "cp_rank must be in [0, cp_world), but got rank=%d world=%d.", cpRank, cpWorld),
                     return ge::GRAPH_FAILED);
@@ -532,8 +534,7 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
                     return ge::GRAPH_FAILED);
         // DCP 下索引保持本地逻辑序号, 由框架统一转全局; 再叠加 output_idx_offset 会重复偏移。
         OP_CHECK_IF(opParamInfo_.outputIdxOffset.tensor != nullptr,
-                    OP_LOGE(opName_, "output_idx_offset must be null when enable_dcp=true."),
-                    return ge::GRAPH_FAILED);
+                    OP_LOGE(opName_, "output_idx_offset must be null when enable_dcp=true."), return ge::GRAPH_FAILED);
     } else {
         OP_CHECK_IF((cpWorld != 1) || (cpRank != 0) || (cpInterleaveSize != 1),
                     OP_LOGE(opName_, "cp_world/cp_rank/cp_kv_cache_interleave_size must be 1/0/1 when "

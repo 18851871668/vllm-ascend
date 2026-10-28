@@ -685,7 +685,17 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessTopK(const QLIV2Common::RunIn
         int32_t neg = -1;
         uint32_t scoreAlign = sizeof(SCORE_T) == 4 ? 8 : 16; // int32对应UB对齐数为8，int16需要16
         if (constInfo_.attenMaskFlag) {
-            validAllS2Len = ((int32_t)i + cuRealAcSeq) / static_cast<int32_t>(constInfo_.cmpRatio);
+            if (constInfo_.dcpEnable) {
+                // DCP: 逐行计算本地可见长度, 不能沿用非 DCP 的累加式上界。
+                int64_t uSigned = static_cast<int64_t>(info.causalGlobalLen) - static_cast<int64_t>(info.actS1Size) +
+                                  static_cast<int64_t>(curAivS1Idx) + static_cast<int64_t>(i) + 1;
+                uint32_t u = (uSigned <= 0) ? 0U : static_cast<uint32_t>(uSigned);
+                uint32_t visible = QLIV2Dcp::CalcDcpVisibleLen(u, info.actS2Size, constInfo_.cpWorld, constInfo_.cpRank,
+                                                               constInfo_.cpInterleaveSize);
+                validAllS2Len = static_cast<int32_t>(visible) / static_cast<int32_t>(constInfo_.cmpRatio);
+            } else {
+                validAllS2Len = ((int32_t)i + cuRealAcSeq) / static_cast<int32_t>(constInfo_.cmpRatio);
+            }
         }
         int32_t validS2Len = validAllS2Len;
         if (info.isNeedLD) {
