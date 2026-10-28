@@ -99,8 +99,8 @@ A5（arch35）额外要求：`VllmAscendQuantLightningIndexerV2Metadata` 必须�
 `enable_dcp/cp_world/cp_rank/cp_kv_cache_interleave_size`。A5 的 FD/LD 会把 metadata 输出的 `s2End` 当作权威块上界，
 metadata 与 kernel 使用同一套 DCP 可见长度公式，否则会漏算。
 
-设计细节见 [docs/qli_v2_dcp_design.md](docs/qli_v2_dcp_design.md)（arch22）与
-[docs/qli_v2_dcp_a5_design.md](docs/qli_v2_dcp_a5_design.md)（arch35）。
+DCP 的详细设计文档仅保留在本地，不入库；仓库内的接口、约束与验证结论以本 README 和
+[docs/aclnnQuantLightningIndexerV2.md](docs/aclnnQuantLightningIndexerV2.md) 为准。
 
 ## 调用示例
 
