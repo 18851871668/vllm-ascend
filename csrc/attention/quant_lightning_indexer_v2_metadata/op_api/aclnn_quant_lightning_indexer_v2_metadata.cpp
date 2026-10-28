@@ -39,7 +39,7 @@ extern "C" {
 static aclnnStatus ParamsCheckQliV2(
     const aclTensor *, const aclTensor *, const aclTensor *, const aclTensor *, const aclTensor *, const aclTensor *,
     int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, char *, char *, int64_t, int64_t, int64_t,
-    int64_t, int64_t, const aclTensor *, uint32_t, uint32_t, const std::string &)
+    int64_t, int64_t, int64_t, const aclTensor *, uint32_t, uint32_t, const std::string &)
 {
     return ACLNN_SUCCESS;
 }
