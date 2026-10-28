@@ -59,6 +59,33 @@ QLI_V2_DCP_INLINE uint32_t CalcDcpVisibleLen(uint32_t u, uint32_t localS2Len, ui
     return (visible < static_cast<uint64_t>(localS2Len)) ? static_cast<uint32_t>(visible) : localS2Len;
 }
 
+// Kernel hot path: period / rankOffset / shift are precomputed once per launch.
+// For power-of-two periods (the common DCP case, e.g. P=8/S=128 -> 1024) this
+// replaces the 64-bit divide/modulo with shift and mask.
+QLI_V2_DCP_INLINE uint32_t CalcDcpVisibleLenU32(uint32_t u, uint32_t localS2Len, uint32_t period,
+                                                uint32_t rankOffset, uint32_t cpInterleaveSize, uint32_t periodShift,
+                                                bool periodPow2)
+{
+    if (u == 0U || period == 0U || cpInterleaveSize == 0U) {
+        return 0U;
+    }
+    uint32_t cycles;
+    uint32_t rem;
+    if (periodPow2) {
+        cycles = u >> periodShift;
+        rem = u & (period - 1U);
+    } else {
+        cycles = u / period;
+        rem = u - cycles * period;
+    }
+    uint32_t fullRounds = cycles * cpInterleaveSize;
+    int32_t diff = static_cast<int32_t>(rem) - static_cast<int32_t>(rankOffset);
+    uint32_t remU = (diff <= 0) ? 0U : static_cast<uint32_t>(diff);
+    uint32_t tail = (remU < cpInterleaveSize) ? remU : cpInterleaveSize;
+    uint64_t visible = static_cast<uint64_t>(fullRounds) + static_cast<uint64_t>(tail);
+    return (visible < static_cast<uint64_t>(localS2Len)) ? static_cast<uint32_t>(visible) : localS2Len;
+}
+
 #undef QLI_V2_DCP_INLINE
 
 } // namespace QLIV2Dcp

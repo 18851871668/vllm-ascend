@@ -532,6 +532,12 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
         OP_CHECK_IF(cpInterleaveSize < 1,
                     OP_LOGE(opName_, "cp_kv_cache_interleave_size must >= 1, but got %d.", cpInterleaveSize),
                     return ge::GRAPH_FAILED);
+        // kernel 用 32 位 period = cp_world * cp_kv_cache_interleave_size 做可见长度计算;
+        // 限制在 int32 内, 保证 rem / rankOffset 的 int32 转换不溢出
+        OP_CHECK_IF(static_cast<int64_t>(cpWorld) * static_cast<int64_t>(cpInterleaveSize) > 0x7FFFFFFFLL,
+                    OP_LOGE(opName_, "cp_world * cp_kv_cache_interleave_size must fit in int32, but got %d * %d.",
+                            cpWorld, cpInterleaveSize),
+                    return ge::GRAPH_FAILED);
         // DCP 下索引保持本地逻辑序号, 由框架统一转全局; 再叠加 output_idx_offset 会重复偏移。
         OP_CHECK_IF(opParamInfo_.outputIdxOffset.tensor != nullptr,
                     OP_LOGE(opName_, "output_idx_offset must be null when enable_dcp=true."), return ge::GRAPH_FAILED);

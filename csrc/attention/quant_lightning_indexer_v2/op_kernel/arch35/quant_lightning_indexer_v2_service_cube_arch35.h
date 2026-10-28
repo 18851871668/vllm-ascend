@@ -51,12 +51,13 @@ public:
     __aicore__ inline void ComputeMm1(const QLIV2Common::RunInfo &runInfo);
 
     static constexpr IsResetLoad3dConfig LOAD3DV2_CONFIG = {true, true}; // isSetFMatrix isSetPadding;
-    static constexpr uint64_t KEY_BUF_NUM = 3;
+    static constexpr uint64_t KEY_BUF_NUM = 4;
     static constexpr uint64_t QUERY_BUF_NUM = 2;
     static constexpr uint64_t L0_BUF_NUM = 2;
 
     static constexpr uint32_t KEY_MTE1_MTE2_EVENT = EVENT_ID2;
-    static constexpr uint32_t QUERY_MTE1_MTE2_EVENT = EVENT_ID5; // KEY_MTE1_MTE2_EVENT + KEY_BUF_NUM;
+    // 3510 有 8 个 MTE1_MTE2 event: KEY(2..5) + QUERY(6..7), M_MTE1 用独立 HardEvent 不冲突
+    static constexpr uint32_t QUERY_MTE1_MTE2_EVENT = EVENT_ID6; // KEY_MTE1_MTE2_EVENT + KEY_BUF_NUM;
     static constexpr uint32_t M_MTE1_EVENT = EVENT_ID3;
 
     static constexpr uint32_t MTE2_MTE1_EVENT = EVENT_ID2;
@@ -139,6 +140,7 @@ protected:
     uint64_t l0BufIdx_ = 0;
 
     bool isKeyCacheValid_ = false; // L1中是否有可复用的数据
+    bool keyBlocksContiguous_ = false; // key 0 轴紧凑且物理块连续时可合并 Nd2Nz
     uint64_t keyGmStart_ = 0;      // L1数据对应的GM S2偏移
     uint64_t keyLoadedSize_ = 0;   // L1中实际加载的S2元素数量
     uint64_t s2BasicBlock_ = 128;
@@ -163,11 +165,12 @@ template <typename QLIV2T>
 __aicore__ inline void QLIV2Matmul<QLIV2T>::InitParams(const ConstInfo &constInfo)
 {
     constInfo_ = constInfo;
-    s2BasicBlock_ = (constInfo_.maxSeqlenQ <= 4 && constInfo_.maxSeqlenQ >= 0) ? 256 : 128;
+    s2BasicBlock_ = constInfo_.useS2Block256 ? 256 : 128;
     qkHeadDim_ = constInfo_.headDim;
     if constexpr (IS_MXFP4) {
         qkHeadDim_ = constInfo_.headDim / FP4_PACK_NUM;
     }
+    keyBlocksContiguous_ = (constInfo_.keyStride0 == constInfo_.kCacheBlockSize * qkHeadDim_);
     scaleHeadDim_ = constInfo_.headDim / MX_SCALE_GROUP_SIZE;
     keyBufferOffset_ = s2BasicBlock_ * D_BASIC_BLOCK;
     keyScaleBufferOffset_ = s2BasicBlock_ * D_BASIC_BLOCK / MX_SCALE_GROUP_SIZE;
@@ -448,10 +451,8 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::KeyNd2NzForPA(uint64_t s2L1RealSize,
         s2Mte2Size = s2BlkOffset + s2Mte2Size >= constInfo_.kCacheBlockSize ? constInfo_.kCacheBlockSize - s2BlkOffset :
                                                                               s2Mte2Size;
         // 相邻逻辑 block 映射到连续物理 block 时合并为一次 Nd2Nz（最多到 s2L1RealSize），
-        // 降低 MTE2 小粒度搬运指令数；仅当 key 0 轴紧凑、物理块在 GM 中连续时启用。
-        const bool keyBlocksContiguous =
-            (constInfo_.keyStride0 == constInfo_.kCacheBlockSize * qkHeadDim_);
-        if (keyBlocksContiguous) {
+        // 降低 MTE2 小粒度搬运指令数；仅在 key 0 轴紧凑且本次还有剩余行时尝试。
+        if (keyBlocksContiguous_ && s2L1Offset + s2Mte2Size < s2L1RealSize) {
             while (s2BlkOffset + s2Mte2Size == constInfo_.kCacheBlockSize &&
                    s2L1Offset + s2Mte2Size < s2L1RealSize) {
                 uint64_t nextBlkNum = (s2BlkOffset + s2Mte2Size) / constInfo_.kCacheBlockSize;
@@ -749,6 +750,7 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::AllocEventID()
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 0);
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 2);
+    SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 3);
 
     SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + 0);
     SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + 1);
@@ -767,6 +769,7 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::FreeEventID()
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 0);
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 2);
+    WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 3);
 
     WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + 0);
     WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + 1);

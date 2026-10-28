@@ -172,6 +172,15 @@ struct ConstInfo {
     uint32_t cpWorld = 1U;           // P: CP 组大小
     uint32_t cpRank = 0U;            // r: 当前 rank
     uint32_t cpInterleaveSize = 1U;  // S: 每 S 个 token 轮换 rank
+    // 预计算的可见长度参数: period = P*S, rankOffset = r*S
+    uint32_t dcpPeriod = 1U;
+    uint32_t dcpRankOffset = 0U;
+    uint32_t dcpPeriodShift = 0U;
+    bool dcpPeriodPow2 = true;
+
+    // 小 Q (max_seqlen_q 0..4) 且总 S2 块数足够大时启用 256-token L1 路径;
+    // 小 batch 下 128 路径的标量/同步开销更低 (2026-10-28 msprof A/B)。
+    bool useS2Block256 = false;
 };
 
 struct LdSplitCoreInfo {
@@ -195,6 +204,11 @@ struct SplitCoreInfo {
     uint32_t bN2End = 0U;
     uint32_t gS1Start = 0U;
     uint32_t gS1End = 0U;
+    // SplitCoreByAICPU 在 s2End==0 时已经算过核尾行组的块数, 缓存给
+    // CalcS2LoopParams 的 isEnd 分支复用, 避免同一行组重复执行 DCP 公式。
+    uint32_t lastGroupS2BlockNum = 0U;
+    uint32_t lastGroupValidS2Len = 0U;
+    bool hasLastGroupSplitInfo = false;
     bool isLD = false; // 当前核是否需要进行Decode归约任务
     bool isCoreEnable = false;
 };

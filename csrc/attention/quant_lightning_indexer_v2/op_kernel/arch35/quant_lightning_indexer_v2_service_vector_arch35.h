@@ -305,6 +305,30 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::InitParams(const struct QLIV2Common:
                 constInfo.sparseCount <= TOPK_5K ? TRUNK_LEN_4K :
                 constInfo.sparseCount <= TOPK_6K ? TRUNK_LEN_2K :
                                                    TRUNK_LEN_12K;
+    // 尾迭代合并: 按该核最大可能行宽对齐 trunkLen, 避免最后一段只剩极小尾巴时
+    // 仍走完整 trunk 的 DataCopy+事件对+TopK 开销 (如 L=33792/topk=2048 时 16K*2+1024
+    // 变成 17K*2, 调用数不变但末段不再只有 1/16 的数据)。
+    {
+        uint32_t maxRowLen = constInfo.kSeqSize;
+        if (constInfo.dcpEnable) {
+            // DCP 行宽上界是本地可见长度, decode 下不会超过 kSeqSize
+            maxRowLen = constInfo.kSeqSize;
+        }
+        uint32_t minTrunk = (topkCountAlign256_ > 0U) ? topkCountAlign256_ : 256U;
+        if (maxRowLen > minTrunk && trunkLen_ > minTrunk) {
+            uint32_t loops = (maxRowLen + trunkLen_ - 1U) / trunkLen_;
+            if (loops > 1U) {
+                uint32_t tail = maxRowLen - (loops - 1U) * trunkLen_;
+                if (tail < trunkLen_ / 2U) {
+                    // 均摊尾块: ceil(maxRowLen/loops) 对齐 256
+                    uint32_t evenTrunk = ((maxRowLen + loops - 1U) / loops + 255U) & ~255U;
+                    if (evenTrunk >= minTrunk && evenTrunk < trunkLen_) {
+                        trunkLen_ = evenTrunk;
+                    }
+                }
+            }
+        }
+    }
     topkCount_ = constInfo.sparseCount;
     topkCountAlign256_ = QLIV2Common::Align(constInfo.sparseCount, (uint64_t)256); // topkCount对齐到256
     topkCountAlign16_ = QLIV2Common::Align(constInfo.sparseCount, (uint64_t)16);   // topkCount对齐到16
@@ -690,8 +714,9 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessTopK(const QLIV2Common::RunIn
                 int64_t uSigned = static_cast<int64_t>(info.causalGlobalLen) - static_cast<int64_t>(info.actS1Size) +
                                   static_cast<int64_t>(curAivS1Idx) + static_cast<int64_t>(i) + 1;
                 uint32_t u = (uSigned <= 0) ? 0U : static_cast<uint32_t>(uSigned);
-                uint32_t visible = QLIV2Dcp::CalcDcpVisibleLen(u, info.actS2Size, constInfo_.cpWorld, constInfo_.cpRank,
-                                                               constInfo_.cpInterleaveSize);
+                uint32_t visible = QLIV2Dcp::CalcDcpVisibleLenU32(
+                    u, info.actS2Size, constInfo_.dcpPeriod, constInfo_.dcpRankOffset, constInfo_.cpInterleaveSize,
+                    constInfo_.dcpPeriodShift, constInfo_.dcpPeriodPow2);
                 validAllS2Len = static_cast<int32_t>(visible) / static_cast<int32_t>(constInfo_.cmpRatio);
             } else {
                 validAllS2Len = ((int32_t)i + cuRealAcSeq) / static_cast<int32_t>(constInfo_.cmpRatio);

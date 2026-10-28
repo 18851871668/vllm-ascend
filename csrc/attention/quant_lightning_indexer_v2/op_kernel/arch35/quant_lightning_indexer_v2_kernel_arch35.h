@@ -234,6 +234,24 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::InitTilingData(const QLIV2TilingDat
     constInfo.cpWorld = tilingData->cpWorld;
     constInfo.cpRank = tilingData->cpRank;
     constInfo.cpInterleaveSize = tilingData->cpInterleaveSize;
+    constInfo.dcpPeriod = constInfo.cpWorld * constInfo.cpInterleaveSize;
+    constInfo.dcpRankOffset = constInfo.cpRank * constInfo.cpInterleaveSize;
+    constInfo.dcpPeriodPow2 = (constInfo.dcpPeriod & (constInfo.dcpPeriod - 1U)) == 0U;
+    uint32_t dcpShift = 0U;
+    uint32_t dcpPeriodTmp = constInfo.dcpPeriod;
+    while (dcpPeriodTmp > 1U) {
+        dcpPeriodTmp >>= 1U;
+        ++dcpShift;
+    }
+    constInfo.dcpPeriodShift = dcpShift;
+
+    // 小 Q 时 256-token L1 路径的吞吐更高, 但小 batch 下 128 路径更省标量/同步;
+    // 以总 S2 块数作为 workload 代理 (B=8: ~2112, B=16: ~4224, B=32: ~8448)。
+    uint64_t totalS2Blocks = static_cast<uint64_t>(constInfo.batchSize) * static_cast<uint64_t>(constInfo.kHeadNum) *
+                             ((static_cast<uint64_t>(constInfo.kSeqSize) + constInfo.s2BaseSize - 1U) /
+                              constInfo.s2BaseSize);
+    constInfo.useS2Block256 = (constInfo.maxSeqlenQ >= 0 && constInfo.maxSeqlenQ <= 4) &&
+                              (totalS2Blocks >= 3000ULL);
 }
 
 template <typename QLIV2T>
@@ -336,6 +354,7 @@ __aicore__ inline uint32_t QLIV2Preload<QLIV2T>::GetS2BaseBlockNumOnMask(uint32_
                                                                          uint32_t actS2SizeOrig,
                                                                          uint32_t causalGlobalLen) {
     if (actS2SizeOrig / constInfo.cmpRatio == 0) {
+        tempLoopInfo.validS2Len = 0U;
         return 0;
     }
     uint32_t s1Offset = constInfo.s1BaseSize * s1gIdx;
@@ -346,8 +365,9 @@ __aicore__ inline uint32_t QLIV2Preload<QLIV2T>::GetS2BaseBlockNumOnMask(uint32_
         int64_t uSigned = static_cast<int64_t>(causalGlobalLen) - static_cast<int64_t>(actS1Size) +
                           static_cast<int64_t>(lastRowCount);
         uint32_t u = (uSigned <= 0) ? 0U : static_cast<uint32_t>(uSigned);
-        uint32_t visible = QLIV2Dcp::CalcDcpVisibleLen(u, actS2SizeOrig / constInfo.cmpRatio, constInfo.cpWorld,
-                                                       constInfo.cpRank, constInfo.cpInterleaveSize);
+        uint32_t visible = QLIV2Dcp::CalcDcpVisibleLenU32(
+            u, actS2SizeOrig / constInfo.cmpRatio, constInfo.dcpPeriod, constInfo.dcpRankOffset,
+            constInfo.cpInterleaveSize, constInfo.dcpPeriodShift, constInfo.dcpPeriodPow2);
         visible = Max(visible, 1U);  // 保持“至少 1 块”的既有不变量
         tempLoopInfo.validS2Len = visible;
         return (visible + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
@@ -407,13 +427,19 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::SplitCoreByAICPU(uint32_t cubeCoreI
             GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size, actS2SizeOrig);
             // s2的切块数量
             uint32_t s2BaseNum;
+            uint32_t lastValidS2Len;
             if (constInfo.attenMaskFlag) {
                 s2BaseNum =
                     GetS2BaseBlockNumOnMask(splitCoreInfo.gS1End, actS1Size, actS2SizeOrig, GetGlobalCausalLen(bIdx));
+                lastValidS2Len = tempLoopInfo.validS2Len;
             } else {
                 s2BaseNum = CeilDiv(actS2Size, constInfo.s2BaseSize);
+                lastValidS2Len = actS2Size;
             }
-            splitCoreInfo.s2End = s2BaseNum - 1;
+            splitCoreInfo.s2End = (s2BaseNum > 0U) ? (s2BaseNum - 1U) : 0U;
+            splitCoreInfo.lastGroupS2BlockNum = s2BaseNum;
+            splitCoreInfo.lastGroupValidS2Len = lastValidS2Len;
+            splitCoreInfo.hasLastGroupSplitInfo = true;
         } else {
             // splitCoreInfo.gS1End == 0 splitCoreInfo.s2End == 0 时，bN2End需要往前退一格
             // 此时需要使用bIdx获取实际Actal S1和S2来计算出 gS1End 和 s2End
@@ -430,13 +456,19 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::SplitCoreByAICPU(uint32_t cubeCoreI
 
             // s2的切块数量
             uint32_t s2BaseNum;
+            uint32_t lastValidS2Len;
             if (constInfo.attenMaskFlag) {
                 s2BaseNum =
                     GetS2BaseBlockNumOnMask(splitCoreInfo.gS1End, actS1Size, actS2SizeOrig, GetGlobalCausalLen(bIdx));
+                lastValidS2Len = tempLoopInfo.validS2Len;
             } else {
                 s2BaseNum = CeilDiv(actS2Size, constInfo.s2BaseSize);
+                lastValidS2Len = actS2Size;
             }
-            splitCoreInfo.s2End = s2BaseNum - 1;
+            splitCoreInfo.s2End = (s2BaseNum > 0U) ? (s2BaseNum - 1U) : 0U;
+            splitCoreInfo.lastGroupS2BlockNum = s2BaseNum;
+            splitCoreInfo.lastGroupValidS2Len = lastValidS2Len;
+            splitCoreInfo.hasLastGroupSplitInfo = true;
         }
     }
     uint32_t ldFirstWorkSpaceIndex =
@@ -607,7 +639,11 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::CalcS2LoopParams(uint32_t bN2LoopId
 
     bool isEnd = (bN2LoopIdx == splitCoreInfo.bN2End) && (gS1LoopIdx == splitCoreInfo.gS1End);
     uint32_t s2BlockNum;
-    if (constInfo.attenMaskFlag) {
+    if (isEnd && splitCoreInfo.hasLastGroupSplitInfo) {
+        // SplitCoreByAICPU 在 s2End==0 时已为该核尾行组算过块数与可见长度, 直接复用
+        s2BlockNum = splitCoreInfo.lastGroupS2BlockNum;
+        tempLoopInfo.validS2Len = splitCoreInfo.lastGroupValidS2Len;
+    } else if (constInfo.attenMaskFlag) {
         s2BlockNum = GetS2BaseBlockNumOnMask(gS1LoopIdx, tempLoopInfo.actS1Size, tempLoopInfo.actS2SizeOrig,
                                              tempLoopInfo.causalGlobalLen);
     } else {
