@@ -22,7 +22,8 @@ A2/A3（arch22）与 A5（arch35）的 DCP 实现是两套不同的分工：
   用闭式公式自行裁剪可见长度；`enable_dcp=1` 仅用于在 A2/A3 上打开 FD/LD（要求 `cmp_ratio=1`）。
   FD 打开后 metadata 的切分范围可能包含整段不可见块，kernel 对「首个分片 ≤ 可见块数」和
   「末分片 `s2End==0` 表示本地完整 L」分别处理，避免漏写归约 partial（上游 `f54a82372`）。
-- **A5（arch35）**：`supportFd_` 在 `maxS2Size_ >= topk` 且 `maxS2Size_ > 5*s2BaseSize_` 时为真，
+- **A5（arch35）**：`supportFd_` 在 `maxVisibleS2 >= topk` 且 `maxVisibleS2 > 5*s2BaseSize_` 时为真
+  （`maxVisibleS2` 是 DCP 可见长度的 batch 最大值，见 §6.4；非 DCP 时退化为本地 L），
   metadata 会把行组按块切分给多个核；arch35 kernel 的 `CalcS2LoopParams()` 在核尾行组直接使用
   `splitCoreInfo.s2End` 作为循环上界，把 metadata 的 `s2End` 当权威值。非 DCP 的组上界是
   `L - Q_len + row`；DCP 可见长度在长 Q chunk 的早期行组可远大于该值（例如
@@ -256,13 +257,27 @@ return {0, (int64_t)visibleForBlock - 1};
 - 否则沿用现有 clip 和 `s2CmpLength=(s2Last-s2First+1)/cmpRatio`；
 - cost、尾块、FD 记录沿用，自动 DCP-aware。
 
-`mask_mode=0` 保持 `attentionMode_==0` 的全本地可见路径。`CalcSplitInfo()` 的 `s2BaseNum` 仍按本地 L 计算，用于空 batch 和 FD 阈值。
+`mask_mode=0` 保持 `attentionMode_==0` 的全本地可见路径。`CalcSplitInfo()` 的 `s2BaseNum` 仍按本地 L 计算（只用于空 batch 判定）；FD 阈值改用 DCP 可见长度，见 §6.4。
 
 ### 6.3 FD/LD 一致性
 
 - FD 开：metadata 输出的每核 `[s2Start,s2End]` 已是 DCP-aware，kernel 截断到同一值；
 - FD 关：metadata `s2End=0`，kernel 用同一闭式重算；
 - `RecordFDInfo/SplitFD/AssignBlockToCore` 不改。
+
+### 6.4 FD 阈值 DCP 化
+
+`CalcSplitInfo()` 的 `supportFd_` 判据改为使用每个 batch 的 DCP 最大可见长度：
+
+- 可见长度对 `u` 单调，batch 内最大值在最后一行（`u = C`），因此
+  `maxVisible = max_b CalcDcpVisibleLen(C_b, L_b, P, r, S)`，不需要遍历行组；
+- 仅当 `enable_dcp=1 && attentionMode_ != 0 && SoC=950` 时使用该值；非 DCP、`mask_mode=0`、
+  A2/A3 仍用本地 L（A2/A3 的 metadata 不做 DCP 换算，见 §1）；
+- 判据本身不变：`maxVisible >= topk && maxVisible > 5*s2BaseSize_`；
+- 目的：`seqused_k` padding 很大、实际可见很小时不再白开 FD 和 S2 切分。
+
+状态：代码已改、编译通过；A5 实机的阈值边界（`maxVisible = 5*s2BaseSize_ ± 1`、`< topk`、`=0`）
+需要在 950 上补测，本机只有 910B3。
 
 ---
 

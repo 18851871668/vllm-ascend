@@ -357,7 +357,19 @@ void QuantLightningIndexerV2MetadataCpuKernel::CalcSplitInfo(SplitContext &split
     for (uint32_t bIdx = 0; bIdx < static_cast<uint32_t>(batchSize_); bIdx++) {
         uint32_t s1Size = GetS1SeqSize(bIdx);
         uint32_t s2Size = GetS2SeqSize(bIdx);
-        maxS2Size_ = std::max(maxS2Size_, s2Size);
+        uint32_t effectiveS2Size = s2Size;
+        if (enableDcp_ != 0 && attentionMode_ != 0 && cpWorld_ > 0 && cpInterleaveSize_ > 0 &&
+            socVersion_.find("Ascend950") != std::string::npos) {
+            // DCP: 可见长度对 u 单调, batch 内最大值在最后一行 (u = C)。FD 阈值必须用真实
+            // 可见长度, 否则 seqused_k padding 很大、实际可见很小时会白白打开 FD 和 S2 切分。
+            uint32_t globalCausalLen = GetGlobalCausalLen(bIdx);
+            uint32_t localS2Len = static_cast<uint32_t>(GetRevertS2Size(bIdx));
+            effectiveS2Size = QLIV2Dcp::CalcDcpVisibleLen(globalCausalLen, localS2Len,
+                                                          static_cast<uint32_t>(cpWorld_),
+                                                          static_cast<uint32_t>(cpRank_),
+                                                          static_cast<uint32_t>(cpInterleaveSize_));
+        }
+        maxS2Size_ = std::max(maxS2Size_, effectiveS2Size);
         splitInfo.s1GBaseNum[bIdx] = (static_cast<uint64_t>(s1Size) * groupSize_ + (mBaseSize_ - 1U)) / mBaseSize_;
         splitInfo.s1GTailSize[bIdx] = (static_cast<uint64_t>(s1Size) * groupSize_) % mBaseSize_;
         splitInfo.s2BaseNum[bIdx] = (s2Size + s2BaseSize_ - 1U) / s2BaseSize_;
