@@ -59,7 +59,7 @@ public:
     __aicore__ inline void InitVecInputTensor(GlobalTensor<half> weightsGm, GlobalTensor<half> qScaleGm,
                                               GlobalTensor<half> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<int32_t> blockTableGm,
-                                              GlobalTensor<bfloat16_t> valueOutGm);
+                                              GlobalTensor<float> valueOutGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline int32_t AlignS2(int32_t cuS2Len);
     __aicore__ inline void AllocEventID();
@@ -74,7 +74,7 @@ protected:
     GlobalTensor<half> kScaleGm;
     GlobalTensor<half> vec0OutGm;
     GlobalTensor<int32_t> indiceOutGm;
-    GlobalTensor<bfloat16_t> valueOutGm;  // DCP/return_value: BF16 分数输出
+    GlobalTensor<float> valueOutGm;  // return_value: FP32 分数输出 (不转 BF16)
     GlobalTensor<int32_t> candidateTopkIndexInGm;
     GlobalTensor<int32_t> candidateTopkIndexOutGm;
     GlobalTensor<int32_t> blockTableGm;
@@ -115,7 +115,7 @@ private:
     TBuf<TPosition::VECCALC> sortOutBuf_;
     TBuf<TPosition::VECCALC> indexBuf_;
     TBuf<TPosition::VECCALC> tmpBuf_;
-    TBuf<TPosition::VECCALC> valueOutBuf_;  // return_value: BF16 分数输出中转 (8KB)
+    TBuf<TPosition::VECCALC> valueOutBuf_;  // return_value: FP32 分数输出中转 (8KB)
 
     // tmp buff for LD
     TBuf<> ldToBeMrgBuf_;
@@ -224,7 +224,7 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::InitBuffers(TPipe *pipe)
     // return_value: BF16 分数输出中转, 仅 return_value=1 时分配 (DCP 必需; candidate 恒为 0, 避免 UB 超限)
     if (constInfo_.returnValue != 0U) {
         // [0, 8KB): FP32 抽取结果; [8KB, 12KB): BF16 转换结果 (避免原地 Cast 的读写重叠)
-        pipe->InitBuffer(valueOutBuf_, BASE_TOPK * sizeof(float) + BASE_TOPK * sizeof(bfloat16_t));     // 12 KB
+        pipe->InitBuffer(valueOutBuf_, BASE_TOPK * sizeof(float));                                        // 8 KB
     }
 
     globalTopkIndice_ = indexBuf_.Get<int32_t>();
@@ -290,7 +290,7 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::InitVecInputTensor(GlobalTensor<half
                                                                GlobalTensor<half> qScaleGm, GlobalTensor<half> kScaleGm,
                                                                GlobalTensor<int32_t> indiceOutGm,
                                                                GlobalTensor<int32_t> blockTableGm,
-                                                               GlobalTensor<bfloat16_t> valueOutGm)
+                                                               GlobalTensor<float> valueOutGm)
 {
     this->weightsGm = weightsGm;
     this->qScaleGm = qScaleGm;
@@ -341,13 +341,13 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::CleanInvalidOutput(int64_t invalidS1
     valueULocal = outQueue_.DeQue<float>();
     QLIV2ServiceVec::CopyOut(indiceOutGm[invalidS1offset], idxULocal1, constInfo_.sparseCount);
     outQueue_.FreeTensor(valueULocal);
-    // return_value: 无效行同步输出 BF16 -inf
+    // return_value: 无效行同步输出 FP32 -inf
     if (constInfo_.returnValue != 0U) {
-        LocalTensor<uint16_t> valU16 = valueOutBuf_.Get<uint16_t>();
-        Duplicate(valU16, static_cast<uint16_t>(QLIV2Common::ConstInfo::NEG_INF_BFLOAT),
+        LocalTensor<float> valF32 = valueOutBuf_.Get<float>();
+        Duplicate(valF32.template ReinterpretCast<int32_t>(), QLIV2ServiceVec::NEG_INF,
                   static_cast<int32_t>(constInfo_.sparseCount));
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        QLIV2ServiceVec::CopyOut(valueOutGm[invalidS1offset], valU16.template ReinterpretCast<bfloat16_t>(),
+        QLIV2ServiceVec::CopyOut(valueOutGm[invalidS1offset], valF32,
                                  static_cast<int64_t>(constInfo_.sparseCount));
         SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     }
@@ -965,14 +965,11 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
                 QLIV2ServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount],
                                          idxULocal.template ReinterpretCast<int32_t>(), constInfo_.sparseCount);
                 outQueue_.FreeTensor(idxULocal);
-                // return_value: BF16 分数与 index 同偏移写出; Cast 目标放在 FP32 源之后避免读写重叠
+                // return_value: FP32 分数与 index 同偏移直接写出 (不做 BF16 Cast)
                 if (constInfo_.returnValue != 0U) {
-                    LocalTensor<bfloat16_t> valueBf16 = valueUb[BASE_TOPK].template ReinterpretCast<bfloat16_t>();
-                    Cast(valueBf16, valueUb, RoundMode::CAST_ROUND, static_cast<int32_t>(constInfo_.sparseCount));
-                    PipeBarrier<PIPE_V>();
                     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
                     QLIV2ServiceVec::CopyOut(valueOutGm[info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount],
-                                             valueBf16, static_cast<int64_t>(constInfo_.sparseCount));
+                                             valueUb, static_cast<int64_t>(constInfo_.sparseCount));
                     SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
                 }
                 // mode=1: 块级 topk 直出 candidate_topk_index
@@ -1195,18 +1192,15 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
             ldInfo_.indiceOutCoreOffset + (ldInfo_.mStart + j) * constInfo_.kHeadNum * constInfo_.sparseCount;
         AscendC::DataCopyPad(indiceOutGm[outOffset], idxULocal1, copyOutParams);
         SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-        // return_value: LD 路径同样输出 BF16 分数 (复用已拷出的 index 缓冲作 Cast 目标)
+        // return_value: LD 路径同样直接输出 FP32 分数
         if (constInfo_.returnValue != 0U) {
-            LocalTensor<bfloat16_t> valueBf16 = outIdxUb.template ReinterpretCast<bfloat16_t>();
-            Cast(valueBf16, outValueUb, RoundMode::CAST_ROUND, static_cast<int32_t>(constInfo_.sparseCount));
-            PipeBarrier<PIPE_V>();
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
             AscendC::DataCopyParams valueCopyParams;
             valueCopyParams.blockCount = 1;
-            valueCopyParams.blockLen = constInfo_.sparseCount * sizeof(bfloat16_t);
+            valueCopyParams.blockLen = constInfo_.sparseCount * sizeof(float);
             valueCopyParams.srcStride = 0;
             valueCopyParams.dstStride = 0;
-            AscendC::DataCopyPad(valueOutGm[outOffset], valueBf16, valueCopyParams);
+            AscendC::DataCopyPad(valueOutGm[outOffset], outValueUb, valueCopyParams);
             SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
         }
     }

@@ -123,7 +123,7 @@ protected:
     GlobalTensor<half> weightsGm;
     GlobalTensor<uint32_t> metadataGm;
     GlobalTensor<int32_t> indiceOutGm;
-    GlobalTensor<bfloat16_t> valueOutGm;  // return_value: BF16 分数输出
+    GlobalTensor<float> valueOutGm;  // return_value: FP32 分数输出
     __gm__ uint8_t *sparseValuesPtr = nullptr;  // ProcessInvalid 全量清理用
     GlobalTensor<int32_t> candidateTopkIndexInGm;
     GlobalTensor<int32_t> candidateTopkIndexOutGm;
@@ -504,7 +504,7 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Init(
 
     InitTilingData(tiling);
     InitActualSeqLen(cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, causalSeqlensKvGlobal);
-    valueOutGm.SetGlobalBuffer((__gm__ bfloat16_t *)sparseValues);
+    valueOutGm.SetGlobalBuffer((__gm__ float *)sparseValues);
     sparseValuesPtr = sparseValues;
 
     if (metadata != nullptr) {
@@ -752,12 +752,12 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::ProcessInvalid()
                 (baseSize + singleCoreSize <= totalOutputSize) ? singleCoreSize : totalOutputSize - baseSize;
             GlobalTensor<OUT_T> output = indiceOutGm[baseSize];
             AscendC::InitGlobalMemory(output, dealSize, constInfo.INVALID_IDX);
-            // return_value: sparse_values 同步填 BF16 -inf (无效槽)
+            // return_value: sparse_values 同步填 FP32 -inf (无效槽, 位型 0xFF800000)
             if (constInfo.returnValue != 0U) {
-                GlobalTensor<uint16_t> valueOutput;
-                valueOutput.SetGlobalBuffer((__gm__ uint16_t *)(sparseValuesPtr + baseSize * sizeof(uint16_t)));
+                GlobalTensor<uint32_t> valueOutput;
+                valueOutput.SetGlobalBuffer((__gm__ uint32_t *)sparseValuesPtr + baseSize);
                 AscendC::InitGlobalMemory(valueOutput, dealSize,
-                                          static_cast<uint16_t>(QLIV2Common::ConstInfo::NEG_INF_BFLOAT));
+                                          static_cast<uint32_t>(QLIV2ServiceVec::NEG_INF));
             }
         }
     }

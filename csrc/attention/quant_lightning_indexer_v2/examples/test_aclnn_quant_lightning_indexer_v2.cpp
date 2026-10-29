@@ -144,7 +144,7 @@ int InitializeTensors(TensorResources &resources)
     std::vector<float> kScaleHostData(kScaleShapeSize, 1.0f);
     std::vector<int32_t> metadataHostData(metadataShapeSize, 0);
     std::vector<int32_t> sparseIndicesHostData(sparseIndicesShapeSize, 0);
-    std::vector<uint16_t> sparseValuesHostData(sparseValuesShapeSize, 0);
+    std::vector<float> sparseValuesHostData(sparseValuesShapeSize, 0);
 
     int ret = CreateAclTensor(queryHostData, queryShape, &resources.queryDeviceAddr, aclDataType::ACL_FLOAT8_E4M3FN,
                               &resources.queryTensor);
@@ -188,8 +188,9 @@ int InitializeTensors(TensorResources &resources)
         return ret;
     }
 
+    // 本样例跑 910B/910_93 (arch22): returnValue=1 时 sparse_values 为 FP32; 950 用 ACL_BF16
     ret = CreateAclTensor(sparseValuesHostData, sparseValuesShape, &resources.sparseValuesDeviceAddr,
-                          aclDataType::ACL_BF16, &resources.sparseValuesTensor);
+                          aclDataType::ACL_FLOAT, &resources.sparseValuesTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) {
         return ret;
     }

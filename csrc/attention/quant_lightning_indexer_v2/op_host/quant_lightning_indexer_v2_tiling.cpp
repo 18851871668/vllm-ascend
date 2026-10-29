@@ -652,10 +652,17 @@ ge::graphStatus QLIV2InfoParser::GetAndCheckInOutDataType()
                                                       QLIV2DataTypeToSerialString(outputType_).c_str(),
                                                       "The dtype of sparse_indices must be int32"),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(valuesOutType_ != ge::DT_BF16,
-                OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(opName_, "sparse_values",
-                                                      QLIV2DataTypeToSerialString(valuesOutType_).c_str(),
-                                                      "The dtype of sparse_values must be bfloat16"),
+    // arch22: return_value!=0 直接输出 FP32 score (不再 Cast 到 BF16);
+    // 950/arch35 保持 BF16 契约。return_value=0 时 sparse_values 为空, 仍按 BF16。
+    ge::DataType expectedValuesType = ge::DT_BF16;
+    if ((npuArch_ == NpuArch::DAV_2201) && (*opParamInfo_.returnValue != 0)) {
+        expectedValuesType = ge::DT_FLOAT;
+    }
+    OP_CHECK_IF(valuesOutType_ != expectedValuesType,
+                OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(
+                    opName_, "sparse_values", QLIV2DataTypeToSerialString(valuesOutType_).c_str(),
+                    expectedValuesType == ge::DT_FLOAT ? "The dtype of sparse_values must be float32 on arch22"
+                                                       : "The dtype of sparse_values must be bfloat16"),
                 return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;

@@ -86,7 +86,9 @@ public:
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
         this->Output("sparse_indices").ParamType(REQUIRED).DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
-        this->Output("sparse_values").ParamType(REQUIRED).DataTypeList({ge::DT_BF16}).FormatList({ge::FORMAT_ND});
+        // arch22 (910B/910_93): return_value != 0 时 score 直接输出 FP32（跨 rank 归并不掉精度）；
+        // return_value == 0 仍为 BF16（占位输出）。950 配置在下方 aicore_config_95 中单独固定为 BF16。
+        this->Output("sparse_values").ParamType(REQUIRED).DataTypeList({ge::DT_FLOAT, ge::DT_BF16}).FormatList({ge::FORMAT_ND});
         this->Output("candidate_topk_index_out").ParamType(OPTIONAL).DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         this->Attr("topk").AttrType(REQUIRED).Int(2048);       // 2048: 筛选前2048个作为输出index
         this->Attr("quant_mode").AttrType(REQUIRED).Int(1);    // 1: per-token-head

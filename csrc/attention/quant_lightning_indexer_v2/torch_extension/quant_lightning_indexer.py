@@ -16,6 +16,21 @@ QLI_METADATA_SIZE = 1024
 QLI_METADATA_OP_NAME = "quant_lightning_indexer_metadata"
 
 
+def _arch22_score_is_fp32():
+    """910B/910_93(arch22) 的 score 输出为 FP32, 950(arch35) 为 BF16。
+
+    Meta 实现要与 C++ 适配层 (量化算子 score 分配) 的 dtype 保持一致;
+    查不到芯片型号时按 arch22 处理 (score 输出主要用于 DCP 跨 rank 归并)。
+    """
+    try:
+        import torch_npu  # noqa: F401
+
+        name = torch.npu.get_device_name(0)
+    except Exception:
+        return True
+    return "Ascend950" not in str(name)
+
+
 class QuantLightningIndexerOpBuilder(OpBuilder):
     def __init__(self):
         super().__init__("quant_lightning_indexer", category="attention")
@@ -130,16 +145,17 @@ class QuantLightningIndexerOpBuilder(OpBuilder):
                     device="meta",
                 )
             if return_value:
+                value_dtype = torch.float32 if _arch22_score_is_fp32() else torch.bfloat16
                 if layout_q == "BSND":
                     sparse_values_out = torch.empty(
                         [query.shape[0], query.shape[1], key_head_num, topk],
-                        dtype=torch.bfloat16,
+                        dtype=value_dtype,
                         device="meta",
                     )
                 else:
                     sparse_values_out = torch.empty(
                         [query.shape[0], key_head_num, topk],
-                        dtype=torch.bfloat16,
+                        dtype=value_dtype,
                         device="meta",
                     )
             else:
