@@ -389,6 +389,12 @@ void QuantLightningIndexerV2MetadataCpuKernel::CalcSplitInfo(SplitContext &split
                                 ((validSocVersion == ValidSocVersion::ASCEND910B) && (enableDcp_ != 0) &&
                                  (cmpRatio_ == 1U));
     if (enableFdCurrentScene) {
+        if (validSocVersion == ValidSocVersion::ASCEND910B) {
+            // 强制打开: A2/A3 的 DCP 场景不再套 fdToleranceRatio 阈值, 也不受 topk 下限约束,
+            // 只要进入 DCP 场景就允许 S2 跨核切分与 QLD 归约 (950 行为保持原样)。
+            supportFd_ = true;
+            return;
+        }
         if (maxS2Size_ < static_cast<uint32_t>(topk_)) {
             supportFd_ = false;
             return;
