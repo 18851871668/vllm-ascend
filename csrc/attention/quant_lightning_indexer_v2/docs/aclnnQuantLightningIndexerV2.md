@@ -809,9 +809,8 @@ int InitializeTensors(TensorResources& resources) {
                           aclDataType::ACL_INT32, &resources.sparseIndicesTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) { return ret; }
 
-    // 910B/910_93 且 returnValue=1 时用 ACL_FLOAT; 950 用 ACL_BF16
     ret = CreateAclTensor(sparseValuesHostData, sparseValuesShape, &resources.sparseValuesDeviceAddr,
-                          aclDataType::ACL_FLOAT, &resources.sparseValuesTensor);
+                          aclDataType::ACL_BF16, &resources.sparseValuesTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) { return ret; }
 
     return ACL_SUCCESS;
