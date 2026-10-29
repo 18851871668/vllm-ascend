@@ -385,9 +385,13 @@ void QuantLightningIndexerV2MetadataCpuKernel::CalcSplitInfo(SplitContext &split
     //   DCP 下每个核拿到的是本地完整 L 的一个连续 S2 段, 每行的可见前缀是绝对长度, 段内自行裁剪,
     //   因此切分与归约语义自洽; 非 DCP 的 S2 上界与 DCP 不同, 不在 A2/A3 上启用。
     // - 仅限 cmp_ratio==1: 压缩路径 + FD 尚未验证。
-    bool enableFdCurrentScene = (validSocVersion == ValidSocVersion::ASCEND950) ||
-                                ((validSocVersion == ValidSocVersion::ASCEND910B) && (enableDcp_ != 0) &&
-                                 (cmpRatio_ == 1U));
+    // - 仅限 attentionMode_ != 0 (mask_mode=3 因果 / band): mask_mode=0 时 metadata 的
+    //   CalcS2TokenRange 直接返回全本地 S2, 不做因果/DCP 上界换算, 且该组合的 LD 分支
+    //   (尤其 A3 local-candidates 路径) 未做硬件验证, 强制开启会 aicore timeout。
+    bool enableFdCurrentScene =
+        (validSocVersion == ValidSocVersion::ASCEND950) ||
+        ((validSocVersion == ValidSocVersion::ASCEND910B) && (enableDcp_ != 0) && (cmpRatio_ == 1U) &&
+         (attentionMode_ != 0));
     if (enableFdCurrentScene) {
         if (validSocVersion == ValidSocVersion::ASCEND910B) {
             // 强制打开: A2/A3 的 DCP 场景不再套 fdToleranceRatio 阈值, 也不受 topk 下限约束,
