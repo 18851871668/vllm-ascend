@@ -897,6 +897,12 @@ if "Ascend910_93" in properties.name:
     ENABLED_PARAMSETS = [
         ("quant_li_default_a3", TEST_PARAMS["quant_li_default_a3"]),
     ]
+elif "Ascend910B" in properties.name:
+    # 910B3 与 910_93 同为 arch22（DAV_2201），复用同一 arch22 参数集；
+    # 缺该分支时本文件在 910B 上 ENABLED_PARAMSETS 未定义，import 即 NameError。
+    ENABLED_PARAMSETS = [
+        ("quant_li_default_a3", TEST_PARAMS["quant_li_default_a3"]),
+    ]
 elif "Ascend950" in properties.name:
     ENABLED_PARAMSETS = [
         (name, TEST_PARAMS[name])
