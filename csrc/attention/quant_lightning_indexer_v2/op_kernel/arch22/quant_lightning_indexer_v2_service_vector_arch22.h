@@ -836,10 +836,10 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
         if (constInfo_.dcpEnable && constInfo_.attenMaskFlag) {
             // DCP (Decode Context Parallel, 解码上下文并行): mask_mode=3 时每行现算
             // u = C - Q_len + rowIdx + 1, 再用闭式公式求本 rank 可见长度。
-            int64_t uSigned = static_cast<int64_t>(info.causalGlobalLen) -
-                              static_cast<int64_t>(info.actS1Size) +
-                              static_cast<int64_t>(cuS1BeginIdxPerAiv + innerS1Idx) + 1;
-            uint32_t u = (uSigned <= 0) ? 0U : static_cast<uint32_t>(uSigned);
+            int64_t uVal = static_cast<int64_t>(info.causalGlobalLen) -
+                           static_cast<int64_t>(info.actS1Size) +
+                           static_cast<int64_t>(cuS1BeginIdxPerAiv + innerS1Idx) + 1;
+            uint32_t u = (uVal <= 0) ? 0U : static_cast<uint32_t>(uVal);
             cuRealAcSeq = static_cast<int32_t>(QLIV2Common::CalcDcpVisibleLen(
                 u, info.actS2Size, constInfo_.cpWorld, constInfo_.cpRank, constInfo_.cpInterleaveSize));
         } else if (constInfo_.attenMaskFlag) {
@@ -889,13 +889,17 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             LocalTensor<float> sortScoreUb = sortBuff;
             LocalTensor<float> sortIndiceUb = sortBuff[cuS2LenVecAlign];
             PipeBarrier<PIPE_V>();
-            Duplicate(sortScoreUb.template ReinterpretCast<int32_t>(), QLIV2ServiceVec::NEG_INF, cuS2LenVecAlign);
-            PipeBarrier<PIPE_V>();
+            // 满块时有效前缀由 Adds 全覆盖，整段 Duplicate 可省；尾块保持原全量初始化，
+            // 避免从非 32B 对齐偏移做 Duplicate（会触发 aicore 异常）。
+            if (cuS2LenVecAlign != cuS2Len) {
+                Duplicate(sortScoreUb.template ReinterpretCast<int32_t>(), QLIV2ServiceVec::NEG_INF, cuS2LenVecAlign);
+                PipeBarrier<PIPE_V>();
+            }
             Adds(sortScoreUb, mmInUb, 0.0f, cuS2Len);
             PipeBarrier<PIPE_V>();
             inQueue_.FreeTensor(mmInUb);
             LocalTensor<int32_t> sortIndiceUbInt = sortIndiceUb.template ReinterpretCast<int32_t>();
-            // 无效数据索引填充为-1
+            // 无效数据索引填充为-1（满块时同样可省）
             if (cuS2LenVecAlign != cuS2Len) {
                 Duplicate(sortIndiceUbInt, -1, cuS2LenVecAlign);
                 PipeBarrier<PIPE_V>();
@@ -913,8 +917,15 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             LocalTensor<float> tmpSortBuf = sortBuff[2 * cuS2LenVecAlign];
             QLIV2ServiceVec::SortAll(sortBuff, tmpSortBuf, cuS2LenVecAlign);
             PipeBarrier<PIPE_V>();
-            QLIV2ServiceVec::MergeSort(globalTopkUb_[innerS1Idx * BASE_TOPK_VALUE_IDX_SIZE], BASE_TOPK, sortBuff,
-                                       cuS2LenVecAlign, tmpSortBuf);
+            // 首个 S2 块（本核该行的 S2 起点）且为满 2048：running TopK 初始全 -inf，
+            // 首次 MergeSort 等价于把 sortBuff 直接搬过去，省一次 MrgSort。
+            if (info.isFirstS2InnerLoop && cuS2LenVecAlign == BASE_TOPK) {
+                AscendC::DataCopy(globalTopkUb_[innerS1Idx * BASE_TOPK_VALUE_IDX_SIZE], sortBuff,
+                                  BASE_TOPK_VALUE_IDX_SIZE);
+            } else {
+                QLIV2ServiceVec::MergeSort(globalTopkUb_[innerS1Idx * BASE_TOPK_VALUE_IDX_SIZE], BASE_TOPK, sortBuff,
+                                           cuS2LenVecAlign, tmpSortBuf);
+            }
             PipeBarrier<PIPE_V>();
             bool isS2End = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq;
             bool needCopyOutGm = blockS2StartIdx_ == 0 && isS2End;
