@@ -149,6 +149,10 @@ private:
     uint64_t weightRowOffset_ = 0;   // 当前 token 在 vec0OutGm 中的 half 行偏移（非候选路径恒 0）
     // v4: 候选 tile 消费序号（每消费一个 tile 自增一次，槽号 = seq % CAND_RING_SLOTS）
     uint32_t candConsTileSeq_ = 0U;
+    // v20: 候选 mm1 的 K L0B 槽轮转序号。上游 K 槽重构后 kSlot = s2L0LoopId % 2，而候选
+    // mm1 的 s2L0LoopId 恒 0 → 单槽串行（LoadKeyToL0b 须等上一 tile 的 MMAD 完成）。
+    // 候选路径恢复预合并版的 4 槽轮转（L0AB_BUF_NUM），装载与 MMAD 跨 tile 重叠。
+    uint32_t candL0bSeq_ = 0U;
 
     TBuf<TPosition::A1> bufQL1_;
     LocalTensor<Q_T> queryL1_;
@@ -310,8 +314,10 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::ProcessQk(uint64_t s1gL0RealSize, ui
             LoadQueryToL0a(s1gL1Offset, runInfo.actMBaseSize, s1gL0RealSize, qSlot);
         }
     }
-    // K 槽按 s2 组号在 0/1 之间轮转；两对 QK 共用，第二对 QK 后归还。
-    const uint64_t kSlot = mmInfo.s2L0LoopId % K_L0B_SLOT_NUM;
+    // K 槽：非候选按 s2 组号在 0/1 之间轮转（两对 QK 共用，第二对 QK 后归还）；
+    // 候选 per-token mm1 的 s2L0LoopId 恒 0，用 4 槽轮转保持装载/MMAD 跨 tile 重叠（v20）。
+    const uint64_t kSlot = candMode_ ? (static_cast<uint64_t>(candL0bSeq_++) % L0AB_BUF_NUM)
+                                     : (mmInfo.s2L0LoopId % K_L0B_SLOT_NUM);
     if (mmInfo.s1gL0LoopId == 0) {
         WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + kSlot);
         LoadKeyToL0b(mmInfo.s2L0RealSize, kSlot);
