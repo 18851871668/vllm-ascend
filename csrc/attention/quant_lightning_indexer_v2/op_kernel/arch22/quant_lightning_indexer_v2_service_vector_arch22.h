@@ -171,14 +171,14 @@ private:
                                               int32_t innerS1Idx);
     // v4 候选驱动：单 token 的 gather / 分数消费（由 RunCandTask 按 token 交错调用）
     __aicore__ inline void GatherTokenCandidates(uint32_t bIdx, uint32_t n2Idx, uint32_t rowBase, uint32_t tokenIdx,
-                                                 uint32_t maxTiles, uint64_t scoreSlotBase, uint32_t tileBegin,
+                                                 uint32_t maxTiles, uint64_t auxSlotBase, uint32_t tileBegin,
                                                  uint32_t tileEnd);
     __aicore__ inline void ConsumeCandScoreToken(uint32_t bIdx, uint32_t rowBase, uint32_t s1RowBase, uint32_t n2Idx,
                                                  uint32_t tokenIdx, uint32_t maxTiles, uint32_t actS1Size,
                                                  uint32_t actS2Size, uint32_t actS2SizeOrig, uint32_t indiceOutOffset,
                                                  uint32_t outputIdxOffsetBase, uint64_t scoreSlotBase,
-                                                 uint32_t tileBegin, uint32_t tileEnd, bool needSpill,
-                                                 uint32_t wsBase);
+                                                 uint64_t auxSlotBase, uint32_t tileBegin, uint32_t tileEnd,
+                                                 bool needSpill, uint32_t wsBase);
     // 记录任务最后一个 token（压入 pending 队列）
     __aicore__ inline void RecordPendingCandScore(uint32_t bIdx, uint32_t rowBase, uint32_t s1RowBase, uint32_t n2Idx,
                                                   uint32_t tokenIdx, uint32_t maxTiles, uint32_t actS1Size,
@@ -1247,13 +1247,17 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::RunCandTask(
     }
     const uint64_t scoreSlotBase = static_cast<uint64_t>(taskSeq & 1U) * QLIV2Common::CAND_SCORE_TILES_PER_TASK *
                                    QLIV2Common::CAND_TILE_TOKENS;
+    // v22：aux 区独立奇偶周期 4（X6 修复，见 kernel Init 注）——score 仍按任务奇偶双缓冲，
+    // aux 按 taskSeq&3 取 4 周期，覆写链在周期 4 下被 AIC(t−2) 完成点严格隔断。
+    const uint64_t auxSlotBase = static_cast<uint64_t>(taskSeq & 3U) * QLIV2Common::CAND_SCORE_TILES_PER_TASK *
+                                 QLIV2Common::CAND_TILE_TOKENS;
     if (maxTiles == 0U) {
         // 空候选任务：不产生 ring 流量与分数信号（AIC 侧同样提前返回），只做整行 -1 输出。
         // pending 队列不在此处消费（延迟策略由队列统一管理，核尾排空）。
         for (uint32_t t = 0U; t < taskTokens; t++) {
             ConsumeCandScoreToken(bIdx, rowBase, s1RowBase, n2Idx, t, maxTiles, actS1Size, actS2Size,
                                   actS2SizeOrig, indiceOutOffset, outputIdxOffsetBase, scoreSlotBase,
-                                  tileBegin, tileEnd, needSpill, wsBase);
+                                  auxSlotBase, tileBegin, tileEnd, needSpill, wsBase);
         }
         return;
     }
@@ -1269,11 +1273,11 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::RunCandTask(
     const uint32_t lagTokens =
         (sliceTiles >= 16U) ? 2U : ((16U + sliceTiles - 1U) / sliceTiles);
     for (uint32_t t = 0U; t < taskTokens; t++) {
-        GatherTokenCandidates(bIdx, n2Idx, rowBase, t, maxTiles, scoreSlotBase, tileBegin, tileEnd);
+        GatherTokenCandidates(bIdx, n2Idx, rowBase, t, maxTiles, auxSlotBase, tileBegin, tileEnd);
         if (t >= lagTokens) {
             ConsumeCandScoreToken(bIdx, rowBase, s1RowBase, n2Idx, t - lagTokens, maxTiles, actS1Size, actS2Size,
                                   actS2SizeOrig, indiceOutOffset, outputIdxOffsetBase, scoreSlotBase,
-                                  tileBegin, tileEnd, needSpill, wsBase);
+                                  auxSlotBase, tileBegin, tileEnd, needSpill, wsBase);
         }
     }
     // drain：AIC 每任务 wait 的令牌数 = tile 数 + 1，最后一个 tile 也能错拍消费
@@ -1331,10 +1335,13 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ConsumePendingCandScore()
     PendingCandScore &rec = pendingScore_[pendingHead_];
     if (rec.valid) {
         rec.valid = false;
+        const uint64_t auxSlotBase =
+            static_cast<uint64_t>(rec.taskSeq & 3U) * QLIV2Common::CAND_SCORE_TILES_PER_TASK *
+            QLIV2Common::CAND_TILE_TOKENS;
         ConsumeCandScoreToken(rec.bIdx, rec.rowBase, rec.s1RowBase, rec.n2Idx, rec.tokenIdx, rec.maxTiles,
                               rec.actS1Size, rec.actS2Size, rec.actS2SizeOrig, rec.indiceOutOffset,
-                              rec.outputIdxOffsetBase, rec.scoreSlotBase, rec.tileBegin, rec.tileEnd,
-                              rec.needSpill, rec.wsBase);
+                              rec.outputIdxOffsetBase, rec.scoreSlotBase, auxSlotBase, rec.tileBegin,
+                              rec.tileEnd, rec.needSpill, rec.wsBase);
     }
     pendingHead_ = (pendingHead_ + 1U) % CAND_PENDING_SCORE_SLOTS;
     --pendingCount_;
@@ -1354,7 +1361,7 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::DrainPendingCandScore()
 template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::GatherTokenCandidates(uint32_t bIdx, uint32_t n2Idx, uint32_t rowBase,
                                                                   uint32_t tokenIdx, uint32_t maxTiles,
-                                                                  uint64_t scoreSlotBase, uint32_t tileBegin,
+                                                                  uint64_t auxSlotBase, uint32_t tileBegin,
                                                                   uint32_t tileEnd)
 {
     // v16：tile 区间 [tileBegin, tileEnd)（FD 分片）；候选索引/辅助区地址恒为绝对行级（maxTiles 整行）
@@ -1395,9 +1402,10 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::GatherTokenCandidates(uint32_t bIdx,
             static_cast<uint64_t>(ringSlot) * CAND_TOKENS_PER_TILE * 128ULL +
             static_cast<uint64_t>(aivHalf) * (CAND_BLOCKS_PER_AIV * CAND_BLOCK_BYTES);
         // v4: kscale 辅助区（本 AIV 半区 32 块 × 16 half = 1KB，分两 chunk 各 512B）
+        // v22: aux 区按 auxSlotBase（taskSeq & 3 的 4 周期）寻址，不再与 score 同 parity
         const uint64_t auxTileBase =
-            2ULL * (scoreSlotBase + static_cast<uint64_t>(tokenIdx * maxTiles + tile) *
-                                        QLIV2Common::CAND_TILE_TOKENS) +
+            2ULL * (auxSlotBase + static_cast<uint64_t>(tokenIdx * maxTiles + tile) *
+                                      QLIV2Common::CAND_TILE_TOKENS) +
             static_cast<uint64_t>(aivHalf) * (CAND_BLOCKS_PER_AIV * 16ULL);
         AscendC::CrossCoreWaitFlag(QLIV2Common::CAND_FREE_FLAG);
         for (uint32_t chunk = 0U; chunk < CAND_BLOCKS_PER_AIV / CAND_BLOCKS_PER_CHUNK; chunk++) {
@@ -1499,8 +1507,8 @@ template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::ConsumeCandScoreToken(
     uint32_t bIdx, uint32_t rowBase, uint32_t s1RowBase, uint32_t n2Idx, uint32_t tokenIdx, uint32_t maxTiles,
     uint32_t actS1Size, uint32_t actS2Size, uint32_t actS2SizeOrig, uint32_t indiceOutOffset,
-    uint32_t outputIdxOffsetBase, uint64_t scoreSlotBase, uint32_t tileBegin, uint32_t tileEnd, bool needSpill,
-    uint32_t wsBase)
+    uint32_t outputIdxOffsetBase, uint64_t scoreSlotBase, uint64_t auxSlotBase, uint32_t tileBegin,
+    uint32_t tileEnd, bool needSpill, uint32_t wsBase)
 {
     constexpr uint32_t CAND_TILE_TOKENS = QLIV2Common::CAND_TILE_TOKENS;
     constexpr uint32_t CAND_BLOCKS_PER_TILE = QLIV2Common::CAND_TILE_BLOCKS;
@@ -1599,15 +1607,19 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ConsumeCandScoreToken(
     sParams.rsv = 0;
     const uint64_t scoreBase0 =
         scoreSlotBase + static_cast<uint64_t>(tokenIdx * maxTiles) * CAND_TILE_TOKENS;
+    // v22: aux 区独立 4 周期寻址（与 score 的 2 周期脱钩，覆写链见 kernel Init 注）
+    const uint64_t auxBase0 =
+        auxSlotBase + static_cast<uint64_t>(tokenIdx * maxTiles) * CAND_TILE_TOKENS;
     // tile 0 预取：sortBuff 的上个读者是上一 token 的 SortAll/MergeSort（V_MTE2 覆盖全部先前排队的 V 读）
     // v16：分片的首 tile = tileBegin（不一定是 0）——预取必须读 tileBegin 的分数/辅助区，
     // 且落进与 tileBegin 奇偶一致的缓冲槽；否则首 tile 消费的是上一任务残留（错分/漏分）。
     const uint64_t scoreFirst = scoreBase0 + static_cast<uint64_t>(tileBegin) * CAND_TILE_TOKENS;
+    const uint64_t auxFirst = auxBase0 + static_cast<uint64_t>(tileBegin) * CAND_TILE_TOKENS;
     LocalTensor<float> firstScore = (tileBegin & 1U) ? scorePing : sortBuff;
     LocalTensor<half> firstPad = (tileBegin & 1U) ? scalePadPing : scalePad;
     SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
     AscendC::DataCopyPad(firstScore, candScoreGm_[scoreFirst], copyParams, padParams);
-    AscendC::DataCopyPad(firstPad, candAuxScaleGm_[2ULL * scoreFirst], sParams, sPad);
+    AscendC::DataCopyPad(firstPad, candAuxScaleGm_[2ULL * auxFirst], sParams, sPad);
     for (uint32_t tile = tileBegin; tile < tileEnd; tile++) {
         if (static_cast<int32_t>(tile * CAND_BLOCKS_PER_TILE) >= L) {
             break;
@@ -1692,7 +1704,10 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ConsumeCandScoreToken(
             LocalTensor<float> nextScore = ((tile + 1U) & 1U) ? scorePing : sortBuff;
             LocalTensor<half> nextPad = ((tile + 1U) & 1U) ? scalePadPing : scalePad;
             AscendC::DataCopyPad(nextScore, candScoreGm_[nextBase], copyParams, padParams);
-            AscendC::DataCopyPad(nextPad, candAuxScaleGm_[2ULL * nextBase], sParams, sPad);
+            AscendC::DataCopyPad(nextPad,
+                                 candAuxScaleGm_[2ULL * (auxBase0 + static_cast<uint64_t>(tile + 1U) *
+                                                                            CAND_TILE_TOKENS)],
+                                 sParams, sPad);
         }
         // v10: 阈值剪枝 —— tile 最大分低于当前 topk 第 topkWidth_ 名时，本 tile 不可能
         // 改变 top-512（严格小于才跳过，相等仍归并，保证同分选择与不剪枝逐位一致）。

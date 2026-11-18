@@ -596,8 +596,13 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Init(
                                               QLIV2Common::CAND_TILE_TOKENS * sizeof(float);
         candScoreGm.SetGlobalBuffer((__gm__ float *)(workspace + offset + aiCoreIdx * CAND_SCORE_BYTES));
         offset += static_cast<uint64_t>(GetBlockNum()) * CAND_SCORE_BYTES;
-        // v4: 候选 kscale 辅助区（每任务 256 tile × 1KB；奇偶双缓冲 = 512KB/核）
-        constexpr uint64_t CAND_AUX_SCALE_BYTES = 2ULL * QLIV2Common::CAND_SCORE_TILES_PER_TASK *
+        // v22: aux 奇偶周期 2→4（X6 根因）。score 区靠 READY 链天然安全（AIC 写 t 需双 AIV
+        // produce(t)，必晚于 AIV0 对 t−2 的 drain-read）；aux 只由单个 AIV 写、无此约束，
+        // 不消费的那个 AIV 会在对侧 drain-read(t−2) 前把 t 的 aux 写进同 parity 区（实测
+        // row11 后半区 kscale 被 row13 覆写）。周期 4 后有严格链：AIV0 drain-read(t−4)
+        // [entry(t−2)] < AIV0 produce(t−2) < AIC(t−2) 完成 < SR(t−2) < AIV1 drain(t)
+        // < AIV1 produce(t)，覆写不可能。区大小 512KB → 1MB/核（aux 是 workspace 末区）。
+        constexpr uint64_t CAND_AUX_SCALE_BYTES = 4ULL * QLIV2Common::CAND_SCORE_TILES_PER_TASK *
                                                   QLIV2Common::CAND_AUX_SCALE_HALVES_PER_TILE * sizeof(half);
         candAuxScaleGm.SetGlobalBuffer((__gm__ half *)(workspace + offset + aiCoreIdx * CAND_AUX_SCALE_BYTES));
         offset += static_cast<uint64_t>(GetBlockNum()) * CAND_AUX_SCALE_BYTES;

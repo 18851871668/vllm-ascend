@@ -1964,10 +1964,13 @@ ge::graphStatus QuantLightningIndexerV2Tiling::DoTiling(QLIV2TilingInfo *tilingI
             constexpr uint32_t CAND_SCORE_DOUBLE_BUF = 2; // v4 跨任务延迟消费
             workspaceSize += static_cast<uint64_t>(aicNum) * CAND_SCORE_DOUBLE_BUF * S1_BASE_SIZE *
                              CAND_SCORE_TILES_MAX * 256 * sizeof(float);
-            // v4: 候选 kscale 辅助区（每任务 128 tile × 2KB，奇偶双缓冲 = 512KB/核）
+            // v22: 候选 kscale 辅助区奇偶周期 2→4（X6 根因：produce 侧单 AIV 可越过对侧
+            // drain-read 覆写同 parity aux，score 区无此问题因 AIC 写被 READY 链拴住）。
+            // 512KB → 1MB/核，与 kernel Init 的 CAND_AUX_SCALE_BYTES 保持一致。
             constexpr uint32_t CAND_AUX_SCALE_TILES = 128; // 4 行 × 32 tile
             constexpr uint32_t CAND_AUX_SCALE_BYTES_PER_TILE = 64 * 16 * sizeof(uint16_t); // 2KB
-            workspaceSize += static_cast<uint64_t>(aicNum) * CAND_SCORE_DOUBLE_BUF * CAND_AUX_SCALE_TILES *
+            constexpr uint32_t CAND_AUX_SCALE_QUAD_BUF = 4;  // aux 奇偶周期（score 仍为 2）
+            workspaceSize += static_cast<uint64_t>(aicNum) * CAND_AUX_SCALE_QUAD_BUF * CAND_AUX_SCALE_TILES *
                              CAND_AUX_SCALE_BYTES_PER_TILE;
         }
     }
