@@ -24,6 +24,7 @@
 #include "cpu_kernel.h"
 #include "cpu_tensor.h"
 #include "../../quant_lightning_indexer_v2/op_kernel/quant_lightning_indexer_v2_metadata.h"
+#include "../../quant_lightning_indexer_v2/op_kernel/quant_lightning_indexer_v2_dcp_common.h"
 #include "../../common/op_kernel/aicpu_common.h"
 
 namespace aicpu {
@@ -172,6 +173,7 @@ struct BatchCache {
     uint32_t bIdx{0U};
     uint32_t s1Size{0U};
     uint64_t revertS2Size{0U};
+    uint32_t causalGlobalLen{0U}; // DCP: 当前 bIdx 的全局 exclusive 上界 C
     int64_t preTokenLeftUp{0};
     int64_t nextTokenLeftUp{0};
     BlockCost<int64_t> typeCost{};
@@ -229,6 +231,7 @@ private:
     bool CheckSequsedK(int32_t batchSize) const;
     bool CheckCmpResidualK(int32_t batchSize) const;
     bool CheckCandidateBlockLength();
+    bool CheckCausalSeqlensKvGlobal(int32_t batchSize) const;
     int32_t GetQueryBatchSize();
     ValidSocVersion ProcessSocVersion();
     bool ParamsInit();
@@ -238,6 +241,7 @@ private:
     // util
     uint32_t GetS1SeqSize(uint32_t bIdx);
     uint32_t GetS2SeqSize(uint32_t bIdx);
+    uint32_t GetGlobalCausalLen(uint32_t bIdx);
     uint64_t GetRevertS2Size(uint32_t bIdx);
     int64_t CalcPreTokenLeftUp(uint32_t s1Size, uint64_t s2Size) const;
     int64_t CalcNextTokenLeftUp(uint32_t s1Size, uint64_t s2Size) const;
@@ -283,6 +287,7 @@ private:
     Tensor *candidateBlockLength_ = nullptr;
     int32_t candLenMax_ = 0;   // 各行最大有效候选块数（未传时为 0）
     int64_t candLenSum_ = 0;   // 各行有效候选块数之和（用于后续调度使用，本期仅记录）
+    Tensor *causalSeqlensKvGlobal_ = nullptr;
     // output
     Tensor *metadata_ = nullptr;
     // attributes
@@ -302,6 +307,12 @@ private:
     std::string layoutK_ = "BSND";
     int32_t maskMode_ = 0;
     int32_t cmpRatio_ = 1;
+    // DCP (Decode Context Parallel, 解码上下文并行) 开关; 1 表示主算子走 DCP 场景。
+    int32_t enableDcp_ = 0;
+    // A5 DCP-aware metadata: C/P/r/S; A2/A3 仅使用 enableDcp_ 打开 FD/LD.
+    int32_t cpWorld_ = 1;
+    int32_t cpRank_ = 0;
+    int32_t cpInterleaveSize_ = 1;
     uint32_t attentionMode_ = 0;
 
     // SplitParams
@@ -324,6 +335,7 @@ private:
         seqUsedK = 3,
         cmpResidualK = 4,
         candidateBlockLength = 5,
+        causalSeqLensKvGlobal = 6,
         // output
         metadata = 0,
     };
